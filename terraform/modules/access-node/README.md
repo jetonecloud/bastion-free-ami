@@ -132,58 +132,16 @@ team out of the VPC at 19:00 on the evening something breaks.
 When enabled, `schedule_summary` says so in the outputs, so an on-call
 engineer finds out before they are paged rather than after.
 
-## Inputs
+## Inputs and outputs
 
-| Name | Type | Default | Description |
-|---|---|---|---|
-| `name` | string | `"bfa-access-node"` | Name prefix. |
-| `ami_id` | string | — | AMI from `packer/`. Read it from SSM. |
-| `instance_type` | string | `"t3.small"` | Must match the AMI architecture. |
-| `subnet_ids` | list(string) | — | **Private** subnets, one per AZ. |
-| `vpc_id` | string | — | VPC for the security group. |
-| `create_security_group` | bool | `true` | Create the egress-only group. |
-| `security_group_ids` | list(string) | `[]` | Existing groups. Must have no inbound rules. |
-| `egress_cidr_blocks` | list(string) | `["0.0.0.0/0"]` | Where the node may connect. Narrow to your VPC CIDR. |
-| `min_size` | number | `1` | Keep ≥ 1 unless using the schedule. |
-| `max_size` | number | `2` | Must exceed `desired_capacity` for a 100%-healthy refresh. |
-| `desired_capacity` | number | `1` | Ignored after creation; see above. |
-| `health_check_grace_period` | number | `300` | Must cover boot plus SSM registration. |
-| `root_volume_size_gb` | number | `10` | ≥ 8. |
-| `ebs_kms_key_id` | string | `""` | Empty uses the default EBS key. Encryption is not optional. |
-| `enable_detailed_monitoring` | bool | `false` | 1-minute metrics. |
-| `enable_instance_refresh` | bool | `true` | How AMI updates roll out. |
-| `instance_refresh_min_healthy_percentage` | number | `100` | 100 needs `max_size > desired_capacity`. |
-| `instance_warmup_seconds` | number | `180` | Must cover SSM registration. |
-| `enable_schedule` | bool | `false` | Scale to zero out of hours. |
-| `schedule_scale_down_cron` | string | `"0 19 * * MON-FRI"` | |
-| `schedule_scale_up_cron` | string | `"0 7 * * MON-FRI"` | |
-| `schedule_scale_down_desired_capacity` | number | `0` | |
-| `schedule_time_zone` | string | `""` | IANA zone; empty means UTC. |
-| `session_log_group_name` | string | `""` | From `session-logging`. |
-| `session_log_bucket_arn` | string | `""` | From `session-logging`. |
-| `session_log_bucket_prefix` | string | `"sessions/"` | |
-| `session_kms_key_arn` | string | `""` | From `session-logging`. |
-| `attach_cloudwatch_agent_policy` | bool | `true` | For OS logs and the disk alarm. |
-| `additional_policy_arns` | list(string) | `[]` | Granted to everyone with a session. |
-| `access_tag_key` | string | `"BastionFreeAccess"` | Matched by `access-iam`. |
-| `access_tag_value` | string | `"shared"` | Use distinct values per pool. |
-| `tags` | map(string) | `{}` | |
+Generated from the `description` field of each variable and
+output by `make docs` (terraform-docs). Those descriptions are
+where the per-setting caveats live; TFLint enforces that every
+variable and output has one.
 
-## Outputs
-
-| Name | Description |
-|---|---|
-| `autoscaling_group_name` / `_arn` | The ASG. |
-| `launch_template_id` / `_latest_version` | The launch template. |
-| `security_group_id` | Egress-only group, or empty. |
-| `iam_role_arn` / `_name` | Instance role. |
-| `iam_instance_profile_name` | Needed by `tests/smoke-test.sh`. |
-| `access_tag_key` / `access_tag_value` | Pass straight into `access-iam`. |
-| `node_filter` | `KEY=VALUE` for `scripts/connect --tag`. |
-| `find_node_command` | Read-only command listing healthy nodes. |
-| `emergency_scale_up_command` | Restore capacity without SSH. |
-| `start_instance_refresh_command` | Trigger an AMI rollout by hand. |
-| `schedule_enabled` / `schedule_summary` | Whether access disappears out of hours. |
+<!-- BEGIN_TF_DOCS -->
+<!-- Run `make docs` to populate this section. -->
+<!-- END_TF_DOCS -->
 
 ## Preconditions
 

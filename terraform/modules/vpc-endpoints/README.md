@@ -84,40 +84,16 @@ unhelpful error:
 - **A custom DNS server needs a conditional forwarder** for
   `amazonaws.com` to the VPC's Amazon DNS server.
 
-## Inputs
+## Inputs and outputs
 
-| Name | Type | Default | Description |
-|---|---|---|---|
-| `name` | string | `"bfa"` | Name prefix. |
-| `vpc_id` | string | — | VPC to create endpoints in. |
-| `subnet_ids` | list(string) | — | One per AZ running access nodes. |
-| `route_table_ids` | list(string) | `[]` | Required when `enable_s3_endpoint`. |
-| `access_node_security_group_ids` | list(string) | `[]` | Preferred over a CIDR. |
-| `vpc_cidr_block` | string | `""` | Fallback when no SG is given. |
-| `enable_ssm_endpoint` | bool | `true` | Required. |
-| `enable_ssmmessages_endpoint` | bool | `true` | Required. |
-| `enable_s3_endpoint` | bool | `true` | Free; agent self-updates. |
-| `enable_ec2messages_endpoint` | bool | `false` | Legacy. |
-| `enable_kms_endpoint` | bool | `true` | For KMS-encrypted sessions. |
-| `enable_logs_endpoint` | bool | `true` | For session and OS logs. |
-| `enable_ec2_endpoint` | bool | `false` | VSS snapshots only. |
-| `private_dns_enabled` | bool | `true` | Keep true. |
-| `endpoint_policy_json` | string | `""` | Optional endpoint policy. |
-| `create_security_group` | bool | `true` | |
-| `endpoint_security_group_ids` | list(string) | `[]` | |
-| `tags` | map(string) | `{}` | |
+Generated from the `description` field of each variable and
+output by `make docs` (terraform-docs). Those descriptions are
+where the per-setting caveats live; TFLint enforces that every
+variable and output has one.
 
-## Outputs
-
-| Name | Description |
-|---|---|
-| `interface_endpoint_ids` | Service name to endpoint ID. |
-| `interface_endpoint_dns_entries` | For diagnosing resolution problems. |
-| `s3_endpoint_id` | Gateway endpoint ID, or empty. |
-| `s3_endpoint_prefix_list_id` | For an egress rule if you narrow `egress_cidr_blocks`. |
-| `security_group_id` | Endpoint security group, or empty. |
-| `enabled_endpoints` | What was created, for review. |
-| `monthly_cost_estimate_usd` | Rough cost, to compare against a NAT gateway. |
+<!-- BEGIN_TF_DOCS -->
+<!-- Run `make docs` to populate this section. -->
+<!-- END_TF_DOCS -->
 
 ## Preconditions
 

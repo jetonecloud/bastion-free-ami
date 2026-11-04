@@ -1,0 +1,54 @@
+---
+# terraform-docs configuration.
+#
+# Regenerate with `make docs`. Only the section between the
+# BEGIN_TF_DOCS / END_TF_DOCS markers in each module README is
+# replaced; the hand-written prose around it -- which is where the AWS
+# caveats live -- is left alone.
+#
+# The generated tables come from the `description` field of each
+# variable and output, so those descriptions are the documentation.
+# Keep them complete: TFLint's terraform_documented_variables and
+# terraform_documented_outputs rules are enabled to enforce that.
+formatter: markdown table
+version: ""
+
+content: |-
+  ## Inputs
+
+  {{ .Inputs }}
+
+  ## Outputs
+
+  {{ .Outputs }}
+
+sections:
+  show:
+    - inputs
+    - outputs
+
+sort:
+  enabled: true
+  by: required
+
+output:
+  file: README.md
+  mode: inject
+  template: |-
+    <!-- BEGIN_TF_DOCS -->
+    {{ .Content }}
+    <!-- END_TF_DOCS -->
+
+settings:
+  anchor: false
+  color: true
+  default: true
+  description: true
+  escape: true
+  hide-empty: true
+  html: false
+  indent: 2
+  lockfile: false
+  required: true
+  sensitive: true
+  type: true

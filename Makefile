@@ -93,9 +93,10 @@ docs:
 	  || (echo "terraform-docs not installed: https://terraform-docs.io/user-guide/installation/"; exit 1)
 	@for d in $(TF_DIR)/modules/*/; do \
 	  echo "== docs $$d"; \
-	  terraform-docs markdown table --output-file README.md \
-	    --output-mode inject --hide-empty "$$d"; \
+	  terraform-docs --config "$(PWD)/.terraform-docs.yml" "$$d"; \
 	done
+	@echo "Injected between the BEGIN_TF_DOCS/END_TF_DOCS markers; the"
+	@echo "hand-written prose in each README is untouched."
 
 clean:
 	rm -rf $(PACKER_DIR)/packer_cache reports artifacts *.log

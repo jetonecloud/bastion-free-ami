@@ -181,48 +181,16 @@ root on the node and is not session-logged, and the service settings
 would let them turn off logging for everyone. An explicit `Deny` cannot
 be overridden by any later `Allow`.
 
-## Inputs
+## Inputs and outputs
 
-| Name | Type | Default | Description |
-|---|---|---|---|
-| `name` | string | `"bfa"` | Prefix for roles, policies, and documents. |
-| `teams` | map(object) | — | Per-team definitions; see below. |
-| `create_roles` | bool | `true` | False emits policies only, for Identity Center. |
-| `access_tag_key` | string | `"BastionFreeAccess"` | Must equal `access-node`'s. |
-| `session_document_name` | string | `"SSM-SessionManagerRunShell"` | Shell document teams may use. |
-| `session_kms_key_arn` | string | `""` | Grants `kms:GenerateDataKey`. Empty breaks KMS-encrypted sessions. |
-| `allow_describe_sessions` | bool | `true` | Cannot be scoped to own sessions. |
-| `enforce_session_document_access_check` | bool | `true` | **Keep true.** |
-| `tags` | map(string) | `{}` | |
+Generated from the `description` field of each variable and
+output by `make docs` (terraform-docs). Those descriptions are
+where the per-setting caveats live; TFLint enforces that every
+variable and output has one.
 
-### The `teams` object
-
-| Field | Type | Default | Description |
-|---|---|---|---|
-| `access_tag_value` | string | — | Which node pool this team reaches. |
-| `trusted_principal_arns` | list(string) | `[]` | Who may assume the role. Required when `create_roles`. |
-| `allow_shell` | bool | `true` | Shell access, fully logged. |
-| `forward_targets` | map(object) | `{}` | `{ host, port, description }` per allowed target. |
-| `local_forward_ports` | list(number) | `[]` | Ports on the node itself. |
-| `allow_unrestricted_forwarding` | bool | `false` | **Voids `forward_targets`.** |
-| `require_mfa` | bool | `true` | Trust-policy MFA condition. |
-| `max_mfa_age_seconds` | number | `null` | 60–43200, or null. |
-| `max_session_duration` | number | `3600` | 3600–43200. |
-| `session_run_as_user` | string | `""` | The elevation path. Cannot be `root`. |
-
-## Outputs
-
-| Name | Description |
-|---|---|
-| `role_arns` / `role_names` | Per team. Empty when `create_roles = false`. |
-| `policy_arns` | Per team. Attach to Identity Center permission sets. |
-| `forward_target_documents` | Document name, host, and port per target. |
-| `local_forward_documents` | Local forwarding documents. |
-| `team_document_arns` | **The authoritative answer to "what can this team reach".** |
-| `connect_commands` | Ready-to-run command per target. |
-| `unrestricted_forwarding_teams` | Teams that can forward anywhere. |
-| `warnings` | Configuration contradictions. Should be empty. |
-| `iam_limitations` | What IAM can and cannot enforce, as data. |
+<!-- BEGIN_TF_DOCS -->
+<!-- Run `make docs` to populate this section. -->
+<!-- END_TF_DOCS -->
 
 ## Check the warnings
 

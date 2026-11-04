@@ -149,35 +149,13 @@ Tunnel contents are **not captured**, the same gap as Session Manager
 port forwarding. CloudTrail records the `OpenTunnel` call — principal,
 instance, port, time — not what passed through the tunnel.
 
-## Inputs
+## Inputs and outputs
 
-| Name | Type | Default | Description |
-|---|---|---|---|
-| `enabled` | bool | `false` | Create the endpoint. |
-| `i_understand_this_reintroduces_ssh` | bool | `false` | Second key required. |
-| `name` | string | `"bfa-eice"` | Name prefix. |
-| `vpc_id` | string | `""` | Required when creating a security group. |
-| `subnet_id` | string | `""` | Required when enabled. One is enough. |
-| `preserve_client_ip` | bool | `false` | See above. |
-| `create_security_group` | bool | `true` | |
-| `security_group_ids` | list(string) | `[]` | |
-| `target_cidr_blocks` | list(string) | `[]` | Required; narrow it. |
-| `allowed_ports` | list(number) | `[22]` | Add 3389 for RDP. |
-| `create_iam_policy` | bool | `true` | |
-| `iam_allowed_remote_ports` | list(number) | `[22]` | Real IAM enforcement. |
-| `iam_allowed_private_ip_cidrs` | list(string) | `[]` | Empty permits any instance in the VPC. |
-| `iam_max_tunnel_duration_seconds` | number | `3600` | 0 omits the condition. |
-| `iam_target_tag_key` / `_value` | string | `""` | Optional tag scoping. |
-| `tags` | map(string) | `{}` | |
+Generated from the `description` field of each variable and
+output by `make docs` (terraform-docs). Those descriptions are
+where the per-setting caveats live; TFLint enforces that every
+variable and output has one.
 
-## Outputs
-
-| Name | Description |
-|---|---|
-| `enabled` | Whether it was actually created (both keys). |
-| `endpoint_id` / `_arn` / `_dns_name` | The endpoint. |
-| `security_group_id` | Reference this in the target's inbound rule. |
-| `iam_policy_arn` | The `OpenTunnel` policy. |
-| `required_target_security_group_rule` | The rule you must add, with IDs filled in. |
-| `connect_commands` | Example commands. |
-| `limitations` | What EICE does and does not give you, as data. |
+<!-- BEGIN_TF_DOCS -->
+<!-- Run `make docs` to populate this section. -->
+<!-- END_TF_DOCS -->

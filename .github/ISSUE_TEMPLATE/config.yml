@@ -1,0 +1,17 @@
+---
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/jetonecloud/bastion-free-ami/security/advisories/new
+    about: >-
+      Please report security issues privately, not as a public issue.
+      See SECURITY.md. Note that port-forwarding session contents not
+      being logged is documented AWS behaviour, not a vulnerability.
+  - name: Documented limitation?
+    url: https://github.com/jetonecloud/bastion-free-ami/blob/main/docs/threat-model.md
+    about: >-
+      Ten known limitations are listed in the threat model with their
+      residual risk and compensating controls. Worth a look first.
+  - name: Commercial support
+    url: https://jetonecloud.com/book
+    about: Jet1 can help you remove your bastion, with an SLA.
