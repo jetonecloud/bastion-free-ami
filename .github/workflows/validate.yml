@@ -1,0 +1,309 @@
+---
+# Pull request validation.
+#
+# This workflow NEVER builds an AMI and NEVER needs AWS credentials.
+# That is deliberate and load-bearing: a pull request can come from a
+# fork, and a fork that could trigger a build could publish an image
+# into the account that this kit uses to control VPC access.
+#
+# The AMI build lives in pipeline.yml, which runs only on main, tags,
+# and the weekly schedule.
+#
+# Everything here therefore runs offline, against mocked providers.
+name: Validate
+
+"on":
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Read-only, with no id-token: this workflow cannot assume an AWS role
+# even if someone adds a step that tries.
+permissions:
+  contents: read
+
+concurrency:
+  group: validate-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PACKER_VERSION: "1.11.2"
+  TERRAFORM_VERSION: "1.9.8"
+  TOFU_VERSION: "1.8.6"
+
+jobs:
+  packer:
+    name: packer fmt + validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: hashicorp/setup-packer@ce93c3c08a6c2ff2275bf4b54ff0d9a75f6c9789 # v3.4.0
+        with:
+          version: ${{ env.PACKER_VERSION }}
+
+      - name: packer fmt -check
+        run: packer fmt -check -recursive packer/
+
+      - name: packer init
+        run: packer init packer/
+
+      # No AWS credentials, so validate with -syntax-only: a full
+      # validate resolves the source_ami_filter against the API.
+      - name: packer validate (x86_64)
+        run: packer validate -syntax-only -var-file=packer/x86_64.pkrvars.hcl packer/
+
+      - name: packer validate (arm64)
+        run: packer validate -syntax-only -var-file=packer/arm64.pkrvars.hcl packer/
+
+      - name: packer validate (al2023-base mode)
+        run: |
+          packer validate -syntax-only \
+            -var-file=packer/al2023-base.pkrvars.hcl \
+            -var-file=packer/x86_64.pkrvars.hcl \
+            packer/
+
+  terraform:
+    name: terraform fmt + validate + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform fmt -check
+        run: terraform fmt -check -recursive terraform/
+
+      - name: terraform validate (all modules and examples)
+        run: |
+          set -euo pipefail
+          for dir in terraform/modules/*/ terraform/examples/*/; do
+            echo "::group::validate ${dir}"
+            terraform -chdir="${dir}" init -backend=false -no-color
+            terraform -chdir="${dir}" validate -no-color
+            echo "::endgroup::"
+          done
+
+      # Runs against mock_provider, so no AWS credentials are needed.
+      # These assert the invariants that make the project's claims true:
+      # no public IP, IMDSv2 hop limit 1, encrypted volumes, no key
+      # pair, mandatory log retention, and the account-wide session
+      # preferences guard rail.
+      - name: terraform test
+        run: |
+          set -euo pipefail
+          for dir in terraform/modules/*/; do
+            if [ -d "${dir}tests" ]; then
+              echo "::group::test ${dir}"
+              terraform -chdir="${dir}" test -no-color
+              echo "::endgroup::"
+            fi
+          done
+
+  opentofu:
+    name: opentofu validate + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
+        with:
+          tofu_version: ${{ env.TOFU_VERSION }}
+          tofu_wrapper: false
+
+      # The project claims OpenTofu support, so it is tested rather
+      # than assumed. Nothing in these modules uses a Terraform-only
+      # feature, and this job is what keeps that true.
+      - name: tofu fmt -check
+        run: tofu fmt -check -recursive terraform/
+
+      - name: tofu validate + test (all modules)
+        run: |
+          set -euo pipefail
+          for dir in terraform/modules/*/; do
+            echo "::group::tofu ${dir}"
+            tofu -chdir="${dir}" init -backend=false -no-color
+            tofu -chdir="${dir}" validate -no-color
+            if [ -d "${dir}tests" ]; then
+              tofu -chdir="${dir}" test -no-color
+            fi
+            echo "::endgroup::"
+          done
+
+  tflint:
+    name: tflint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: terraform-linters/setup-tflint@6ffdbaa3be476b3431f7275c26966ef32ff60337 # v6.3.2
+        with:
+          tflint_version: v0.54.0
+
+      - name: tflint --init
+        run: tflint --init
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: tflint
+        run: tflint --recursive --config="$(pwd)/.tflint.hcl"
+
+  ansible:
+    name: ansible-lint + syntax-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install ansible and ansible-lint
+        run: |
+          pip install --disable-pip-version-check \
+            "ansible-core>=2.16,<2.19" \
+            "ansible-lint>=24.2" \
+            "yamllint>=1.35"
+
+      - name: Install collections
+        run: ansible-galaxy collection install -r ansible/requirements.yml
+
+      # Passes without the upstream clone present, because the playbook
+      # includes those roles dynamically.
+      - name: ansible-playbook --syntax-check
+        run: ansible-playbook --syntax-check ansible/playbook.yml
+        env:
+          ANSIBLE_CONFIG: ansible/ansible.cfg
+
+      - name: ansible-lint
+        run: ansible-lint ansible/playbook.yml
+
+  yamllint:
+    name: yamllint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install yamllint
+        run: pip install --disable-pip-version-check "yamllint>=1.35"
+
+      - name: yamllint
+        run: yamllint .
+
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: shellcheck
+        run: |
+          shellcheck --severity=warning \
+            scripts/connect \
+            scripts/verify \
+            scripts/fetch-upstream-roles.sh \
+            packer/scripts/*.sh \
+            tests/smoke-test.sh \
+            tests/scripts/*.sh
+
+      - name: shfmt (formatting)
+        env:
+          SHFMT_VERSION: "v3.14.1"
+          SHFMT_CHECKSUM: "76e77641faa025814b77f153b29796b8e6fa2fca03e0c76a691608b86c7ea7bf"
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/shfmt \
+            "https://github.com/mvdan/sh/releases/download/${SHFMT_VERSION}/shfmt_${SHFMT_VERSION}_linux_amd64"
+          echo "${SHFMT_CHECKSUM}  /tmp/shfmt" | sha256sum -c -
+          chmod +x /tmp/shfmt
+          /tmp/shfmt -d -i 2 -ci \
+            scripts/connect \
+            scripts/verify \
+            scripts/fetch-upstream-roles.sh \
+            packer/scripts/*.sh \
+            tests/smoke-test.sh \
+            tests/scripts/*.sh
+
+  script-tests:
+    name: script tests (verify is read-only)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # "It's read-only" is a claim people act on -- they run this
+      # against production, during an incident, with elevated
+      # credentials. So it is tested, not asserted. Static, gate, and
+      # behavioural checks; no AWS credentials needed.
+      - name: scripts/verify makes no AWS write calls
+        run: bash tests/scripts/test-verify-readonly.sh
+
+      - name: scripts parse and respond to --help
+        run: |
+          bash -n scripts/connect
+          bash -n scripts/verify
+          ./scripts/connect --help >/dev/null
+          ./scripts/verify --help >/dev/null
+
+  config-scan:
+    name: config scan (Trivy + Checkov)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Trivy's own install script, pinned by version. Not the
+      # trivy-action, so the version and its checksum are visible here
+      # rather than inside an action.
+      - name: Install Trivy
+        env:
+          TRIVY_VERSION: "0.76.1"
+          TRIVY_CHECKSUM: "c7cbe3137fb8a48a17574bede3dd6beb16742d1e9772929940fc90082c39d9c0"
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/trivy.tar.gz \
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          echo "${TRIVY_CHECKSUM}  /tmp/trivy.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/trivy.tar.gz -C /tmp trivy
+          sudo install -m 0755 /tmp/trivy /usr/local/bin/trivy
+          trivy --version
+
+      - name: Trivy config scan
+        run: |
+          trivy config \
+            --severity HIGH,CRITICAL \
+            --exit-code 1 \
+            --ignorefile .trivyignore \
+            terraform/ packer/ ansible/
+
+      - name: Trivy secret scan
+        run: |
+          trivy filesystem \
+            --scanners secret \
+            --exit-code 1 \
+            --severity LOW,MEDIUM,HIGH,CRITICAL \
+            .
+
+      # Checkov runs from pip rather than from checkov-action, so the
+      # version is pinned here and visible in review rather than inside
+      # an action that resolves its own.
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install Checkov
+        run: pip install --disable-pip-version-check "checkov==3.2.334"
+
+      - name: Checkov scan
+        run: |
+          checkov --directory terraform/ \
+            --framework terraform \
+            --quiet \
+            --compact \
+            --config-file .checkov.yml

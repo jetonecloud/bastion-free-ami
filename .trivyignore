@@ -1,0 +1,39 @@
+# Trivy misconfiguration findings that are deliberate in this repo.
+# Each entry states why. An unexplained entry is not acceptable --
+# see CONTRIBUTING.md.
+
+# AVD-AWS-0104: Security group allows egress to multiple public
+# destinations.
+#
+# The access node's egress is the variable egress_cidr_blocks, which
+# defaults to 0.0.0.0/0 because an access node that cannot reach your
+# datastores serves no purpose, and hardcoding a guess at your database
+# port would break more deployments than it protected. There is NO
+# corresponding ingress rule and no way to create one -- the module has
+# no ingress resource and no variable for it. The private-subnets
+# example narrows egress to the VPC CIDR, which is the documented
+# recommendation.
+AVD-AWS-0104
+
+# AVD-AWS-0057: IAM policy with wildcard resource.
+#
+# Three places, all unavoidable and each commented in the source:
+#   * the five Session Manager ssmmessages actions operate on the
+#     agent's own control/data channel, which has no ARN to name --
+#     this matches AWS's documented minimal instance policy
+#   * ssm:DescribeInstanceInformation has no resource-level permission
+#     support at all
+#   * ec2:DescribeInstances and ssm:DescribeSessions are list
+#     operations that accept no resource ARN
+# All are read-only or channel-scoped. Access is constrained by the
+# ssm:resourceTag condition on StartSession, which is the control that
+# actually matters.
+AVD-AWS-0057
+
+# AVD-AWS-0017: CloudWatch log group is not encrypted.
+#
+# False positive against the module's conditional resource: the log
+# group sets kms_key_id unconditionally from local.kms_key_arn, and
+# terraform test asserts it. Trivy cannot resolve the local through the
+# count expression.
+AVD-AWS-0017

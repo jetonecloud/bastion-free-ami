@@ -1,0 +1,44 @@
+---
+# Checkov configuration.
+#
+# Skips below are deliberate and each carries its reason. A skip without
+# a reason is not acceptable in this repo -- see CONTRIBUTING.md.
+quiet: true
+compact: true
+framework:
+  - terraform
+
+skip-check:
+  # The access node's security group is egress-only by design, and the
+  # module provides no way to add an ingress rule. Checkov flags the
+  # broad egress CIDR, which is the variable egress_cidr_blocks: a node
+  # that cannot reach your datastores is useless, and guessing your RDS
+  # port would break more than it protected. The private-subnets
+  # example narrows it to the VPC CIDR, which is the documented
+  # recommendation.
+  - CKV_AWS_382 # Security group allows egress to 0.0.0.0/0
+
+  # KMS key policies attach to exactly one key, and "*" within them
+  # means "this key". A key policy cannot name its own ARN because the
+  # ARN does not exist until the key is created. Scoping is done with
+  # conditions (aws:SourceAccount, kms:EncryptionContext), which is
+  # what AWS's own documented key policies do.
+  - CKV_AWS_109 # IAM policies should not allow permissions without constraints
+  - CKV_AWS_111 # IAM policies should not allow write access without constraints
+
+  # The S3 archive bucket deliberately has no access logging bucket.
+  # Adding one creates a second bucket that itself wants access
+  # logging, and the recursion has to stop somewhere. CloudTrail data
+  # events are the better control for a bucket holding session logs,
+  # and are configured outside this module's scope.
+  - CKV_AWS_18 # S3 bucket should have access logging enabled
+
+  # Cross-region replication of session transcripts is a decision about
+  # data residency that this module should not make for you. Pass an
+  # existing bucket via s3_bucket_name if you need it.
+  - CKV_AWS_144 # S3 bucket should have cross-region replication enabled
+
+  # The ASG does not use an ELB, so an ELB health check is impossible.
+  # EC2 health checks are the only signal available for an access node,
+  # and the module sets them.
+  - CKV_AWS_315 # Autoscaling groups should use ELB health checks

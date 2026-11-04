@@ -1,0 +1,427 @@
+---
+# Build, test, scan, publish.
+#
+# Runs on main, on version tags, on a weekly schedule, and on manual
+# dispatch. It does NOT run on pull requests, and the `if` on every job
+# enforces that even if the triggers above are ever widened: a pull
+# request can come from a fork, and a fork able to trigger this
+# workflow could publish an AMI into the account that controls VPC
+# access.
+#
+# Pull request feedback comes from validate.yml, which needs no AWS
+# credentials at all.
+#
+# Gate order: build -> test (Goss) -> scan (Trivy) -> publish. Publish
+# depends on both gates, so an AMI with a startable sshd or a CRITICAL
+# vulnerability never reaches the SSM parameter that Terraform reads.
+name: Pipeline
+
+"on":
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+    paths:
+      - "packer/**"
+      - "ansible/**"
+      - "tests/goss/**"
+      - ".github/workflows/pipeline.yml"
+  schedule:
+    # Weekly rebuild. This project patches by rebuilding the image
+    # rather than mutating running instances: a new AMI plus the ASG's
+    # instance refresh replaces nodes without anyone logging in.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      build_version:
+        description: "Override the AMI version (defaults to an auto-generated value)"
+        required: false
+        type: string
+      architectures:
+        description: "Architectures to build"
+        required: false
+        default: "both"
+        type: choice
+        options: ["both", "x86_64", "arm64"]
+      source_mode:
+        description: "Source AMI: the published hardened-al2023 image, or the public AL2023 base with upstream roles applied"
+        required: false
+        default: "hardened-ami"
+        type: choice
+        options: ["hardened-ami", "al2023-base"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pipeline-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  PACKER_VERSION: "1.11.2"
+
+jobs:
+  # -------------------------------------------------------------------
+  # Belt and braces: fail loudly rather than silently skipping, if this
+  # workflow is ever reached from a pull request.
+  # -------------------------------------------------------------------
+  guard:
+    name: guard (never build on pull requests)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Refuse to run for a pull request
+        if: github.event_name == 'pull_request' || github.event_name == 'pull_request_target'
+        run: |
+          echo "This workflow builds and publishes AMIs and must never run"
+          echo "for a pull request. Pull request validation is validate.yml."
+          exit 1
+
+      - name: Confirm the trigger
+        run: echo "Triggered by ${{ github.event_name }} on ${{ github.ref }}"
+
+  setup:
+    name: setup
+    needs: guard
+    runs-on: ubuntu-latest
+    outputs:
+      build_version: ${{ steps.version.outputs.build_version }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      source_args: ${{ steps.source.outputs.source_args }}
+    steps:
+      - name: Determine build version
+        id: version
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.build_version }}" ]; then
+            v="${{ inputs.build_version }}"
+          elif [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            v="${GITHUB_REF#refs/tags/v}"
+          elif [ "${GITHUB_EVENT_NAME}" = "schedule" ]; then
+            v="scheduled-$(date -u +%Y%m%d)"
+          else
+            v="0.0.0-dev.${GITHUB_RUN_NUMBER}+${GITHUB_SHA::7}"
+          fi
+          echo "build_version=${v}" >> "$GITHUB_OUTPUT"
+          echo "Build version: ${v}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Determine architecture matrix
+        id: matrix
+        run: |
+          set -euo pipefail
+          case "${{ inputs.architectures || 'both' }}" in
+            x86_64) m='["x86_64"]' ;;
+            arm64)  m='["arm64"]' ;;
+            *)      m='["x86_64","arm64"]' ;;
+          esac
+          echo "matrix=${m}" >> "$GITHUB_OUTPUT"
+
+      - name: Determine source mode
+        id: source
+        run: |
+          set -euo pipefail
+          # al2023-base builds from the public AL2023 AMI and applies the
+          # upstream hardened-al2023 roles. The default inherits them
+          # from the published hardened AMI instead. See docs/design.md.
+          if [ "${{ inputs.source_mode || 'hardened-ami' }}" = "al2023-base" ]; then
+            echo "source_args=-var-file=al2023-base.pkrvars.hcl" >> "$GITHUB_OUTPUT"
+          else
+            echo "source_args=" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: build (${{ matrix.arch }})
+    needs: setup
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ${{ fromJSON(needs.setup.outputs.matrix) }}
+    permissions:
+      contents: read
+      id-token: write # OIDC only; no static credentials exist
+    outputs:
+      ami_id: ${{ steps.manifest.outputs.ami_id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: hashicorp/setup-packer@ce93c3c08a6c2ff2275bf4b54ff0d9a75f6c9789 # v3.4.0
+        with:
+          version: ${{ env.PACKER_VERSION }}
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install Ansible
+        run: |
+          pip install --disable-pip-version-check "ansible-core>=2.16,<2.19"
+          ansible-galaxy collection install -r ansible/requirements.yml
+
+      # Only needed in al2023-base mode; clones the upstream repo at a
+      # pinned tag rather than vendoring it. See docs/design.md.
+      - name: Fetch upstream hardening roles
+        if: ${{ (inputs.source_mode || 'hardened-ami') == 'al2023-base' }}
+        run: bash scripts/fetch-upstream-roles.sh
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: packer init
+        run: packer init packer/
+
+      - name: packer build
+        working-directory: packer
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086
+          packer build \
+            -var-file="${{ matrix.arch }}.pkrvars.hcl" \
+            ${{ needs.setup.outputs.source_args }} \
+            -var "aws_region=${AWS_REGION}" \
+            -var "vpc_id=${{ vars.PACKER_VPC_ID }}" \
+            -var "subnet_id=${{ vars.PACKER_SUBNET_ID }}" \
+            -var "kms_key_id=${{ vars.PACKER_KMS_KEY_ID }}" \
+            -var "build_version=${{ needs.setup.outputs.build_version }}" \
+            -var "extra_tags={\"GitSha\":\"${GITHUB_SHA}\",\"Workflow\":\"${GITHUB_WORKFLOW}\",\"RunId\":\"${GITHUB_RUN_ID}\"}" \
+            .
+
+      - name: Extract the AMI ID
+        id: manifest
+        working-directory: reports
+        run: |
+          set -euo pipefail
+          AMI_ID="$(jq -r '.builds[-1].artifact_id' manifest.json | cut -d: -f2)"
+          echo "ami_id=${AMI_ID}" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Built (${{ matrix.arch }})"
+            echo "- AMI: \`${AMI_ID}\`"
+            echo "- Region: \`${AWS_REGION}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: reports-${{ matrix.arch }}
+          path: reports/
+          retention-days: 90
+
+  test:
+    name: test (Goss, ${{ matrix.arch }})
+    needs: [setup, build]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ${{ fromJSON(needs.setup.outputs.matrix) }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: reports-${{ matrix.arch }}
+          path: reports
+
+      # The Goss suites already fail the Packer build on a blocking
+      # failure, so reaching here with failures means something went
+      # wrong with the gate itself. Re-checked anyway: this is the gate
+      # that makes "sshd is disabled" a property of every published AMI
+      # rather than a claim in a README.
+      - name: Evaluate blocking Goss results
+        run: |
+          set -euo pipefail
+          FAILED="$(jq '[.[].summary["failed-count"]] | add // 0' reports/goss-results.json)"
+          TOTAL="$(jq '[.[].summary["test-count"]] | add // 0' reports/goss-results.json)"
+
+          {
+            echo "### Goss (${{ matrix.arch }})"
+            echo "- Tests: ${TOTAL}"
+            echo "- Failed: ${FAILED}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${TOTAL}" -eq 0 ]; then
+            echo "No Goss tests ran. Refusing to treat an empty suite as a pass."
+            exit 1
+          fi
+
+          if [ "${FAILED}" -gt 0 ]; then
+            echo "Blocking Goss failures detected:"
+            jq -r '.[].results[]? | select(.successful == false)
+                   | "  FAIL: \(.property) on \(."resource-id") -- expected \(.expected), got \(.found)"' \
+              reports/goss-results.json || true
+            exit 1
+          fi
+
+          echo "All ${TOTAL} blocking Goss tests passed."
+
+      - name: Summarise advisory results
+        if: always()
+        run: |
+          if [ -f reports/goss-advisory-results.json ]; then
+            {
+              echo "### Goss advisory (informational, ${{ matrix.arch }})"
+              echo '```'
+              jq -r '.[]?.results[]? | "\(if .successful then "ok" else "note" end): \(.property) = \(.found)"' \
+                reports/goss-advisory-results.json 2>/dev/null | head -30 || echo "(none)"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  scan:
+    name: scan (Trivy, ${{ matrix.arch }})
+    needs: [setup, build]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ${{ fromJSON(needs.setup.outputs.matrix) }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: reports-${{ matrix.arch }}
+          path: reports
+
+      - name: Evaluate Trivy results
+        run: |
+          set -euo pipefail
+          CRITICAL="$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' reports/trivy-report.json)"
+          HIGH="$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' reports/trivy-report.json)"
+          SECRETS="$(jq '[.Results[]?.Secrets[]?] | length' reports/trivy-report.json)"
+
+          {
+            echo "### Trivy (${{ matrix.arch }})"
+            echo "- CRITICAL: ${CRITICAL}"
+            echo "- HIGH: ${HIGH}"
+            echo "- Secrets: ${SECRETS}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${SECRETS}" -gt 0 ]; then
+            echo "Secrets found baked into the image:"
+            jq -r '.Results[]?.Secrets[]? | "  \(.RuleID): \(.Title)"' reports/trivy-report.json
+            echo "A published access-node AMI must contain no secrets."
+            exit 1
+          fi
+
+          if [ "${CRITICAL}" -gt 0 ]; then
+            echo "CRITICAL vulnerabilities:"
+            jq -r '.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")
+                   | "  \(.VulnerabilityID) in \(.PkgName) \(.InstalledVersion) -> \(.FixedVersion // "no fix available")"' \
+              reports/trivy-report.json
+            echo "Refusing to publish."
+            exit 1
+          fi
+
+          echo "No CRITICAL vulnerabilities and no secrets."
+
+  publish:
+    name: publish
+    needs: [setup, build, test, scan]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # for the GitHub Release on a tag
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: reports-*
+          path: artifacts
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Publishes to /bastion-free-ami/<region>/latest, which the
+      # access-node module reads via data.aws_ssm_parameter. An
+      # architecture-specific parameter is published alongside, because
+      # one "latest" cannot serve both and silently handing an arm64
+      # AMI to a t3 launch template produces an instance that will not
+      # boot.
+      - name: Point the SSM parameters at the new AMIs
+        run: |
+          set -euo pipefail
+          published=()
+
+          for dir in artifacts/reports-*; do
+            arch="${dir#artifacts/reports-}"
+            manifest="${dir}/manifest.json"
+            [ -f "${manifest}" ] || { echo "no manifest in ${dir}"; exit 1; }
+
+            AMI_ID="$(jq -r '.builds[-1].artifact_id' "${manifest}" | cut -d: -f2)"
+            VERSION="$(jq -r '.builds[-1].custom_data.build_version' "${manifest}")"
+
+            # Per-architecture parameter: always correct.
+            aws ssm put-parameter \
+              --name "/bastion-free-ami/${AWS_REGION}/${arch}/latest" \
+              --type String \
+              --value "${AMI_ID}" \
+              --description "Latest bastion-free-ami ${arch} AMI (version ${VERSION})" \
+              --overwrite
+
+            # The documented path, pointed at x86_64 for compatibility
+            # with the examples' default instance types.
+            if [ "${arch}" = "x86_64" ]; then
+              aws ssm put-parameter \
+                --name "/bastion-free-ami/${AWS_REGION}/latest" \
+                --type String \
+                --value "${AMI_ID}" \
+                --description "Latest bastion-free-ami AMI, x86_64 (version ${VERSION})" \
+                --overwrite
+            fi
+
+            aws ec2 create-tags --resources "${AMI_ID}" \
+              --tags "Key=PublishedVersion,Value=${VERSION}" \
+              "Key=PublishedAt,Value=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+            published+=("${arch}: ${AMI_ID} (${VERSION})")
+          done
+
+          {
+            echo "### Published"
+            for p in "${published[@]}"; do echo "- ${p}"; done
+            echo ""
+            echo "SSM parameters:"
+            echo '```'
+            echo "/bastion-free-ami/${AWS_REGION}/latest"
+            echo "/bastion-free-ami/${AWS_REGION}/<arch>/latest"
+            echo '```'
+            echo ""
+            echo "Roll this out by applying the access-node module: the"
+            echo "launch template picks up the new AMI and the ASG's"
+            echo "instance refresh replaces nodes. Nobody logs in."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create a GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # Flatten the per-architecture reports into uniquely named
+          # assets: every artifact contains a manifest.json, so they
+          # would collide if attached as-is.
+          mkdir -p release-assets
+          for dir in artifacts/reports-*; do
+            arch="${dir#artifacts/reports-}"
+            for f in "${dir}"/*.json; do
+              [ -f "${f}" ] || continue
+              cp "${f}" "release-assets/${arch}-$(basename "${f}")"
+            done
+          done
+
+          mapfile -t assets < <(find release-assets -type f -name '*.json' | sort)
+
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            "${assets[@]}"
