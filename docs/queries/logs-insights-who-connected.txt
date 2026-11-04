@@ -1,0 +1,10 @@
+fields @timestamp, @logStream, @message
+| parse @logStream /^(?<sessionPrincipal>[^-]+)-(?<sessionSuffix>.*)$/
+| stats
+    min(@timestamp) as sessionStart,
+    max(@timestamp) as sessionLastActivity,
+    (max(@timestamp) - min(@timestamp)) / 1000 as durationSeconds,
+    count(*) as logEvents
+  by @logStream, sessionPrincipal
+| sort sessionStart desc
+| limit 200

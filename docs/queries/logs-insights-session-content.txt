@@ -1,0 +1,14 @@
+# Search shell session content for a string.
+#
+# Replace SEARCH_TERM below. Only shell sessions appear here --
+# port-forwarding traffic is never captured, so a tunnel that carried
+# the thing you are looking for will not match.
+#
+# Treat results as sensitive: session content can include credentials
+# typed at a prompt.
+
+fields @timestamp, @logStream, @message
+| parse @logStream /^(?<sessionPrincipal>[^-]+)-/
+| filter @message like /SEARCH_TERM/
+| sort @timestamp desc
+| limit 100

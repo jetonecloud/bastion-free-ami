@@ -1,0 +1,18 @@
+# Privilege escalation attempts inside shell sessions.
+#
+# On a correctly built access node, ssm-user has no sudo grant, so
+# every hit here should be either a failed attempt or a session started
+# by a role tagged SSMSessionRunAs with a privileged OS user.
+#
+# A sudden cluster of hits from a principal that is not the elevation
+# role is worth investigating.
+
+fields @timestamp, @logStream, @message
+| parse @logStream /^(?<sessionPrincipal>[^-]+)-/
+| filter @message like /(?i)(sudo|su -|su root|pkexec|doas|systemctl unmask|usermod -aG)/
+| stats count(*) as attempts,
+        earliest(@timestamp) as firstSeen,
+        latest(@timestamp) as lastSeen
+  by sessionPrincipal, @logStream
+| sort attempts desc
+| limit 100
