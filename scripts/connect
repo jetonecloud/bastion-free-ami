@@ -1,0 +1,421 @@
+#!/usr/bin/env bash
+# connect -- find a healthy access node and start a session.
+#
+# This is a thin wrapper around `aws ssm start-session`. It does three
+# things and nothing else:
+#
+#   1. checks your prerequisites, and says exactly what is missing
+#   2. finds a healthy access node by tag, so you do not paste instance
+#      IDs around
+#   3. prints the AWS command it is about to run, then runs it
+#
+# It deliberately does NOT: construct targets from partial input, guess
+# a database endpoint, cache credentials, keep state, wrap your database
+# client, or accept a target it was not given explicitly. If you want to
+# know what it did, read the command it printed -- you can always run
+# that yourself, and after a while you will not need this script.
+#
+# Everything it does is also doable by hand. That is the point.
+set -euo pipefail
+
+PROGRAM="$(basename "$0")"
+VERSION="1.0.0"
+
+# ---------------------------------------------------------------------
+# Defaults
+# ---------------------------------------------------------------------
+TAG="${BFA_TAG:-BastionFreeAccess=shared}"
+REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-}}"
+PROFILE="${AWS_PROFILE:-}"
+MODE=""
+REMOTE_HOST=""
+REMOTE_PORT=""
+LOCAL_PORT=""
+DOCUMENT=""
+TARGET=""
+DRY_RUN="false"
+REASON=""
+
+usage() {
+  cat <<'EOF'
+connect -- find a healthy bastion-free access node and start a session.
+
+USAGE
+  connect [--tag KEY=VALUE] [options] <command>
+
+COMMANDS
+  shell                       Open an interactive shell on an access node.
+  forward                     Port-forward through an access node.
+  list                        List healthy access nodes and exit.
+
+FORWARDING OPTIONS
+  --host HOST                 Remote host to forward to (e.g. an RDS
+                              endpoint). Omit for a port on the node
+                              itself.
+  --port PORT                 Remote port. Required with forward.
+  --local-port PORT           Local port to listen on. Defaults to the
+                              remote port.
+  --document NAME             Session document to use. REQUIRED when your
+                              team is restricted to per-target documents,
+                              which is the normal setup -- ask your
+                              platform team, or read the
+                              forward_target_documents output of the
+                              access-iam module.
+
+GENERAL OPTIONS
+  --tag KEY=VALUE             Tag identifying the node pool.
+                              Default: BastionFreeAccess=shared
+                              (override with BFA_TAG)
+  --target INSTANCE_ID        Use this instance instead of searching.
+  --region REGION             AWS region.
+  --profile PROFILE           AWS profile.
+  --reason "TEXT"             Recorded with the session for the audit
+                              trail. Worth using.
+  --dry-run                   Print the command and exit without running.
+  -h, --help                  This help.
+  --version                   Print version.
+
+EXAMPLES
+  # Shell on a node in the shared pool
+  connect shell
+
+  # Postgres through a per-team document (the usual case)
+  connect forward --document bfa-pf-payments-db --local-port 5432
+
+  # Postgres with the generic document, if your team has it
+  connect forward --host mydb.cluster-abc.eu-west-1.rds.amazonaws.com \
+                  --port 5432 --local-port 5432
+
+  # A port on the access node itself
+  connect forward --port 8080 --local-port 8080
+
+NOTES
+  Port-forwarding session CONTENT is not logged by AWS. CloudTrail
+  records that the tunnel existed, with who, what, and for how long --
+  not what passed through it. Shell sessions ARE fully logged, including
+  keystrokes, so do not type secrets at a prompt: use
+  `stty -echo; read VAR; stty echo`.
+EOF
+}
+
+log() { printf '%s\n' "$*" >&2; }
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+# ---------------------------------------------------------------------
+# Prerequisites. Checked up front and reported together, because
+# discovering them one at a time is tedious.
+# ---------------------------------------------------------------------
+check_prerequisites() {
+  local missing=0
+
+  if ! command -v aws >/dev/null 2>&1; then
+    log "MISSING: the AWS CLI (aws)."
+    log "  Install: https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html"
+    missing=1
+  else
+    local aws_major
+    aws_major="$(aws --version 2>&1 | sed -n 's#^aws-cli/\([0-9]*\).*#\1#p')"
+    if [ -n "${aws_major}" ] && [ "${aws_major}" -lt 2 ]; then
+      log "WARNING: AWS CLI v1 detected. v2 is recommended; some session"
+      log "  features require it."
+    fi
+  fi
+
+  # The single most common reason start-session fails. The CLI returns
+  # an unhelpful error, so check it explicitly.
+  if ! command -v session-manager-plugin >/dev/null 2>&1; then
+    log "MISSING: the Session Manager plugin (session-manager-plugin)."
+    log "  Without it, 'aws ssm start-session' fails with an unhelpful error."
+    log "  Install: https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html"
+    log "  AWS requires version 1.2.764.0 or later."
+    missing=1
+  fi
+
+  if ! command -v jq >/dev/null 2>&1; then
+    log "MISSING: jq."
+    log "  Install: https://jqlang.github.io/jq/download/"
+    missing=1
+  fi
+
+  [ "${missing}" -eq 0 ] || die "install the prerequisites above and try again"
+
+  # Credentials. A clear message here beats an AccessDenied later.
+  if ! aws sts get-caller-identity "${AWS_ARGS[@]}" >/dev/null 2>&1; then
+    log "Your AWS credentials are not working."
+    log "  Try: aws sso login${PROFILE:+ --profile ${PROFILE}}"
+    log "  Or check AWS_PROFILE / AWS_REGION."
+    die "no usable AWS credentials"
+  fi
+}
+
+# Shared CLI arguments, built once into an array so they are passed as
+# distinct words without relying on word splitting. Included in the
+# command this script prints, so what you see is what runs.
+AWS_ARGS=()
+build_aws_args() {
+  AWS_ARGS=()
+  [ -n "${REGION}" ] && AWS_ARGS+=(--region "${REGION}")
+  [ -n "${PROFILE}" ] && AWS_ARGS+=(--profile "${PROFILE}")
+  return 0
+}
+
+# ---------------------------------------------------------------------
+# Node discovery. Read-only: describe-instance-information returns only
+# nodes whose SSM Agent is actually connected, which is a better health
+# signal than EC2's instance state.
+# ---------------------------------------------------------------------
+find_nodes() {
+  local tag_key="${TAG%%=*}"
+  local tag_value="${TAG#*=}"
+
+  [ "${tag_key}" != "${TAG}" ] || die "--tag must be KEY=VALUE, got '${TAG}'"
+
+  aws ssm describe-instance-information "${AWS_ARGS[@]}" \
+    --filters "Key=tag:${tag_key},Values=${tag_value}" \
+    --output json 2>/dev/null |
+    jq -r '[.InstanceInformationList[]
+            | select(.PingStatus == "Online")
+            | {id: .InstanceId, agent: .AgentVersion, platform: .PlatformName,
+               ip: (.IPAddress // "unknown")}]'
+}
+
+pick_node() {
+  local nodes count
+  nodes="$(find_nodes)"
+  count="$(printf '%s' "${nodes}" | jq 'length')"
+
+  if [ "${count}" -eq 0 ]; then
+    log "No healthy access node found with tag ${TAG}."
+    log
+    log "Things to check, in order:"
+    log "  1. Is the ASG scaled above zero? Some deployments scale to"
+    log "     zero out of hours. Scale up with:"
+    log "       aws autoscaling set-desired-capacity \\"
+    log "         --auto-scaling-group-name <asg> --desired-capacity 1"
+    log "  2. Is the tag right? Default is BastionFreeAccess=shared;"
+    log "     override with --tag or BFA_TAG."
+    log "  3. Can the node reach Systems Manager? In a no-NAT VPC it"
+    log "     needs the ssm and ssmmessages interface endpoints."
+    log "  4. Run scripts/verify for a full read-only posture check."
+    log
+    log "If you are locked out entirely, see"
+    log "docs/migrating-from-a-bastion.md -- it has a lockout runbook."
+    die "no healthy access node available"
+  fi
+
+  if [ "${count}" -gt 1 ]; then
+    log "Found ${count} healthy nodes; using the first."
+  fi
+
+  printf '%s' "${nodes}" | jq -r '.[0].id'
+}
+
+# ---------------------------------------------------------------------
+# Running the command. Always printed first.
+# ---------------------------------------------------------------------
+show_and_run() {
+  log "+ $*"
+  log
+  if [ "${DRY_RUN}" = "true" ]; then
+    log "(--dry-run: not executing)"
+    return 0
+  fi
+  "$@"
+}
+
+cmd_list() {
+  local nodes
+  nodes="$(find_nodes)"
+
+  if [ "$(printf '%s' "${nodes}" | jq 'length')" -eq 0 ]; then
+    log "No healthy access nodes with tag ${TAG}."
+    return 1
+  fi
+
+  printf '%-22s %-16s %-12s %s\n' "INSTANCE ID" "PRIVATE IP" "AGENT" "PLATFORM"
+  printf '%s' "${nodes}" |
+    jq -r '.[] | [.id, .ip, .agent, .platform] | @tsv' |
+    while IFS=$'\t' read -r id ip agent platform; do
+      printf '%-22s %-16s %-12s %s\n' "${id}" "${ip}" "${agent}" "${platform}"
+    done
+}
+
+cmd_shell() {
+  local target="${TARGET}"
+  [ -n "${target}" ] || target="$(pick_node)"
+
+  local -a cmd=(aws ssm start-session)
+  cmd+=("${AWS_ARGS[@]}")
+  cmd+=(--target "${target}")
+  [ -n "${DOCUMENT}" ] && cmd+=(--document-name "${DOCUMENT}")
+  [ -n "${REASON}" ] && cmd+=(--reason "${REASON}")
+
+  log "Opening a shell on ${target}."
+  log "This session is logged, including keystrokes. Do not type secrets"
+  log "at a prompt -- use: stty -echo; read VAR; stty echo"
+  log
+  show_and_run "${cmd[@]}"
+}
+
+cmd_forward() {
+  [ -n "${REMOTE_PORT}" ] || [ -n "${DOCUMENT}" ] ||
+    die "forward needs --port, or a --document that has the port baked in"
+
+  local target="${TARGET}"
+  [ -n "${target}" ] || target="$(pick_node)"
+
+  local local_port="${LOCAL_PORT:-${REMOTE_PORT}}"
+  [ -n "${local_port}" ] ||
+    die "--local-port is required when the port comes from --document"
+
+  # Warn, but do not block: a port already in use is the single most
+  # common forwarding failure, and the CLI error is opaque.
+  if command -v ss >/dev/null 2>&1 && ss -ltnH 2>/dev/null | grep -qE ":${local_port}\b"; then
+    log "WARNING: something is already listening on local port ${local_port}."
+    log "  The session will fail to bind. Pick another --local-port."
+    log
+  fi
+
+  local document="${DOCUMENT}"
+  local -a params=()
+
+  if [ -n "${document}" ]; then
+    # A per-team document. Host and port are fixed properties of the
+    # document, so only localPortNumber is passed. This is the normal
+    # case and the one that actually enforces an allowlist.
+    params=(--parameters "{\"localPortNumber\":[\"${local_port}\"]}")
+  elif [ -n "${REMOTE_HOST}" ]; then
+    # The generic remote-host document. Only works if your team has
+    # been granted it -- which also means your team can forward
+    # anywhere the node can reach.
+    document="AWS-StartPortForwardingSessionToRemoteHost"
+    params=(--parameters "{\"host\":[\"${REMOTE_HOST}\"],\"portNumber\":[\"${REMOTE_PORT}\"],\"localPortNumber\":[\"${local_port}\"]}")
+    log "NOTE: using the generic ${document} document. If this returns"
+    log "  AccessDenied, your team is restricted to per-target documents;"
+    log "  pass --document instead."
+    log
+  else
+    # A port on the access node itself.
+    document="AWS-StartPortForwardingSession"
+    params=(--parameters "{\"portNumber\":[\"${REMOTE_PORT}\"],\"localPortNumber\":[\"${local_port}\"]}")
+  fi
+
+  local -a cmd=(aws ssm start-session)
+  cmd+=("${AWS_ARGS[@]}")
+  cmd+=(--target "${target}" --document-name "${document}")
+  cmd+=("${params[@]}")
+  [ -n "${REASON}" ] && cmd+=(--reason "${REASON}")
+
+  log "Forwarding localhost:${local_port} through ${target}${REMOTE_HOST:+ to ${REMOTE_HOST}}."
+  log
+  log "Two things worth knowing:"
+  log "  * Traffic through this tunnel is NOT logged. CloudTrail records"
+  log "    that the session happened, not what went through it."
+  log "  * Connecting via localhost breaks TLS hostname verification."
+  log "    See docs/access-paths.md for the per-datastore fix."
+  log
+
+  show_and_run "${cmd[@]}"
+}
+
+# ---------------------------------------------------------------------
+# Arguments
+# ---------------------------------------------------------------------
+while [ $# -gt 0 ]; do
+  case "$1" in
+    shell | forward | list)
+      [ -z "${MODE}" ] || die "only one command at a time (already have '${MODE}')"
+      MODE="$1"
+      shift
+      ;;
+    --tag)
+      TAG="${2:?--tag needs a value}"
+      shift 2
+      ;;
+    --target)
+      TARGET="${2:?--target needs a value}"
+      shift 2
+      ;;
+    --host)
+      REMOTE_HOST="${2:?--host needs a value}"
+      shift 2
+      ;;
+    --port)
+      REMOTE_PORT="${2:?--port needs a value}"
+      shift 2
+      ;;
+    --local-port)
+      LOCAL_PORT="${2:?--local-port needs a value}"
+      shift 2
+      ;;
+    --document)
+      DOCUMENT="${2:?--document needs a value}"
+      shift 2
+      ;;
+    --region)
+      REGION="${2:?--region needs a value}"
+      shift 2
+      ;;
+    --profile)
+      PROFILE="${2:?--profile needs a value}"
+      shift 2
+      ;;
+    --reason)
+      REASON="${2:?--reason needs a value}"
+      shift 2
+      ;;
+    --dry-run)
+      DRY_RUN="true"
+      shift
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    --version)
+      printf '%s %s\n' "${PROGRAM}" "${VERSION}"
+      exit 0
+      ;;
+    *)
+      die "unknown argument '$1' (try --help)"
+      ;;
+  esac
+done
+
+[ -n "${MODE}" ] || {
+  usage
+  exit 1
+}
+
+# Validate ports before touching AWS.
+for p in "${REMOTE_PORT}" "${LOCAL_PORT}"; do
+  if [ -n "${p}" ]; then
+    case "${p}" in
+      *[!0-9]*) die "port '${p}' is not a number" ;;
+    esac
+    { [ "${p}" -ge 1 ] && [ "${p}" -le 65535 ]; } ||
+      die "port '${p}' is out of range (1-65535)"
+  fi
+done
+
+if [ -n "${TARGET}" ]; then
+  case "${TARGET}" in
+    i-*) ;;
+    *) die "--target must be an instance ID (i-...), got '${TARGET}'" ;;
+  esac
+fi
+
+[ "${MODE}" = "forward" ] || [ -z "${REMOTE_HOST}" ] ||
+  die "--host only applies to 'forward'"
+
+build_aws_args
+check_prerequisites
+
+case "${MODE}" in
+  list) cmd_list ;;
+  shell) cmd_shell ;;
+  forward) cmd_forward ;;
+esac

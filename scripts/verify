@@ -1,0 +1,528 @@
+#!/usr/bin/env bash
+# verify -- read-only posture check for a bastion-free deployment.
+#
+# Answers one question: is this deployment actually bastion-free, or
+# does it just look like it?
+#
+# Checks, for the access nodes matching a tag:
+#   * public IPs
+#   * inbound security group rules (any, and port 22 specifically)
+#   * EC2 key pairs attached
+#   * IMDSv2 enforcement and hop limit
+#   * EBS encryption
+#   * session logging destination, KMS encryption, and retention
+#   * S3 archive public access and encryption
+#   * whether a healthy node is actually available
+#
+# READ-ONLY. This script makes no AWS write call of any kind. Every AWS
+# invocation goes through aws_read(), which rejects any verb that is not
+# Describe/List/Get, so a future edit cannot quietly introduce one.
+# tests/scripts/test-verify-readonly.sh enforces this in CI.
+#
+# Exit codes:
+#   0  all checks passed
+#   1  one or more FAIL findings
+#   2  usage or prerequisite error
+set -euo pipefail
+
+PROGRAM="$(basename "$0")"
+VERSION="1.0.0"
+
+TAG="${BFA_TAG:-BastionFreeAccess=shared}"
+REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-}}"
+PROFILE="${AWS_PROFILE:-}"
+LOG_GROUP=""
+S3_BUCKET=""
+OUTPUT="text"
+STRICT="false"
+
+PASS_COUNT=0
+WARN_COUNT=0
+FAIL_COUNT=0
+FINDINGS_JSON="[]"
+
+usage() {
+  cat <<'EOF'
+verify -- read-only posture check for a bastion-free deployment.
+
+USAGE
+  verify [options]
+
+OPTIONS
+  --tag KEY=VALUE      Tag identifying the access nodes.
+                       Default: BastionFreeAccess=shared (or BFA_TAG)
+  --log-group NAME     Session log group to check. Without this, the
+                       logging checks are skipped rather than guessed.
+  --s3-bucket NAME     Session log archive bucket to check.
+  --region REGION      AWS region.
+  --profile PROFILE    AWS profile.
+  --json               Machine-readable output.
+  --strict             Treat WARN as failure (exit 1).
+  -h, --help           This help.
+  --version            Print version.
+
+WHAT IT DOES NOT DO
+  No writes. No remediation. No changes of any kind. It reports, and
+  you decide. Every AWS call is Describe/List/Get, enforced in code and
+  tested in CI.
+
+EXAMPLES
+  verify --tag BastionFreeAccess=payments
+  verify --log-group /aws/ssm/bfa/sessions --s3-bucket bfa-session-logs-111122223333
+  verify --json | jq '.findings[] | select(.status=="FAIL")'
+EOF
+}
+
+log() { printf '%s\n' "$*" >&2; }
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 2
+}
+
+# ---------------------------------------------------------------------
+# The read-only gate.
+#
+# Every AWS call in this script goes through here. The allowlist is on
+# the OPERATION name, not on the service, so adding a write call means
+# editing this list -- which is a visible, reviewable change rather
+# than a line that slips through.
+# ---------------------------------------------------------------------
+aws_read() {
+  local service="$1" operation="$2"
+  shift 2
+
+  case "${operation}" in
+    describe-* | list-* | get-*) ;;
+    *)
+      die "internal: refusing non-read operation '${service} ${operation}'. scripts/verify is read-only by contract."
+      ;;
+  esac
+
+  local -a args=(aws "${service}" "${operation}")
+  [ -n "${REGION}" ] && args+=(--region "${REGION}")
+  [ -n "${PROFILE}" ] && args+=(--profile "${PROFILE}")
+  args+=("$@")
+
+  "${args[@]}" 2>/dev/null
+}
+
+# ---------------------------------------------------------------------
+# Findings
+# ---------------------------------------------------------------------
+record() {
+  local status="$1" check="$2" detail="$3" remedy="${4:-}"
+
+  case "${status}" in
+    PASS) PASS_COUNT=$((PASS_COUNT + 1)) ;;
+    WARN) WARN_COUNT=$((WARN_COUNT + 1)) ;;
+    FAIL) FAIL_COUNT=$((FAIL_COUNT + 1)) ;;
+  esac
+
+  FINDINGS_JSON="$(
+    printf '%s' "${FINDINGS_JSON}" |
+      jq --arg s "${status}" --arg c "${check}" --arg d "${detail}" --arg r "${remedy}" \
+        '. + [{status:$s, check:$c, detail:$d, remedy:$r}]'
+  )"
+
+  if [ "${OUTPUT}" = "text" ]; then
+    local colour reset=""
+    if [ -t 1 ]; then
+      reset=$'\033[0m'
+      case "${status}" in
+        PASS) colour=$'\033[32m' ;;
+        WARN) colour=$'\033[33m' ;;
+        FAIL) colour=$'\033[31m' ;;
+      esac
+    else
+      colour=""
+    fi
+    printf '  %s%-4s%s %-42s %s\n' "${colour}" "${status}" "${reset}" "${check}" "${detail}"
+    [ -n "${remedy}" ] && printf '       %s\n' "-> ${remedy}"
+  fi
+}
+
+section() {
+  [ "${OUTPUT}" = "text" ] || return 0
+  printf '\n%s\n' "$1"
+  printf '%s\n' "$(printf '%.0s-' $(seq 1 ${#1}))"
+}
+
+# ---------------------------------------------------------------------
+# Checks
+# ---------------------------------------------------------------------
+SECURITY_GROUP_IDS=""
+
+check_instances() {
+  section "Access nodes (tag ${TAG})"
+
+  local tag_key="${TAG%%=*}" tag_value="${TAG#*=}"
+  [ "${tag_key}" != "${TAG}" ] || die "--tag must be KEY=VALUE, got '${TAG}'"
+
+  local instances
+  instances="$(aws_read ec2 describe-instances \
+    --filters "Name=tag:${tag_key},Values=${tag_value}" \
+    "Name=instance-state-name,Values=running,pending,stopping,stopped" \
+    --output json || echo '{}')"
+
+  local count
+  count="$(printf '%s' "${instances}" | jq '[.Reservations[]?.Instances[]?] | length')"
+
+  if [ "${count}" -eq 0 ]; then
+    record WARN "access nodes found" \
+      "no instances match tag ${TAG}" \
+      "If the ASG is scaled to zero this is expected; otherwise check the tag and the ASG."
+    return 0
+  fi
+
+  record PASS "access nodes found" "${count} instance(s)"
+
+  SECURITY_GROUP_IDS="$(printf '%s' "${instances}" |
+    jq -r '[.Reservations[]?.Instances[]?.SecurityGroups[]?.GroupId] | unique | join(" ")')"
+
+  # --- public IPs ---
+  local public
+  public="$(printf '%s' "${instances}" |
+    jq -r '[.Reservations[]?.Instances[]? | select(.PublicIpAddress != null)
+            | "\(.InstanceId)=\(.PublicIpAddress)"] | join(", ")')"
+
+  if [ -n "${public}" ]; then
+    record FAIL "no public IP on access nodes" \
+      "public IPs present: ${public}" \
+      "A node with a public IP is a bastion. Set associate_public_ip_address=false and replace the instances."
+  else
+    record PASS "no public IP on access nodes" "none of the ${count} node(s) has a public IP"
+  fi
+
+  # --- key pairs ---
+  local keyed
+  keyed="$(printf '%s' "${instances}" |
+    jq -r '[.Reservations[]?.Instances[]? | select(.KeyName != null)
+            | "\(.InstanceId)=\(.KeyName)"] | join(", ")')"
+
+  if [ -n "${keyed}" ]; then
+    record FAIL "no SSH key pair attached" \
+      "key pairs attached: ${keyed}" \
+      "Remove key_name from the launch template. sshd is masked on the AMI, so the key is useless as well as contrary to the design."
+  else
+    record PASS "no SSH key pair attached" "no instance has an EC2 key pair"
+  fi
+
+  # --- IMDSv2 ---
+  local imds_v1 hop
+  imds_v1="$(printf '%s' "${instances}" |
+    jq -r '[.Reservations[]?.Instances[]?
+            | select(.MetadataOptions.HttpTokens != "required")
+            | .InstanceId] | join(", ")')"
+
+  if [ -n "${imds_v1}" ]; then
+    record FAIL "IMDSv2 required" \
+      "IMDSv1 still allowed on: ${imds_v1}" \
+      "Set http_tokens=required. With IMDSv1, anything on the node that can make an HTTP request can read the instance role credentials."
+  else
+    record PASS "IMDSv2 required" "http_tokens=required on all nodes"
+  fi
+
+  hop="$(printf '%s' "${instances}" |
+    jq -r '[.Reservations[]?.Instances[]?
+            | select(.MetadataOptions.HttpPutResponseHopLimit > 1)
+            | "\(.InstanceId)=\(.MetadataOptions.HttpPutResponseHopLimit)"] | join(", ")')"
+
+  if [ -n "${hop}" ]; then
+    record WARN "IMDS hop limit is 1" \
+      "hop limit above 1 on: ${hop}" \
+      "Hop limit 1 stops a container or proxied process borrowing the instance role. Raise only if you knowingly run containers that need IMDS."
+  else
+    record PASS "IMDS hop limit is 1" "hop limit 1 on all nodes"
+  fi
+
+  # --- EBS encryption ---
+  local volume_ids unencrypted
+  volume_ids="$(printf '%s' "${instances}" |
+    jq -r '[.Reservations[]?.Instances[]?.BlockDeviceMappings[]?.Ebs.VolumeId] | join(" ")')"
+
+  if [ -n "${volume_ids}" ]; then
+    # shellcheck disable=SC2086 # volume_ids is a deliberate list
+    unencrypted="$(aws_read ec2 describe-volumes --volume-ids ${volume_ids} --output json |
+      jq -r '[.Volumes[]? | select(.Encrypted != true) | .VolumeId] | join(", ")' || echo "")"
+
+    if [ -n "${unencrypted}" ]; then
+      record FAIL "EBS volumes encrypted" "unencrypted volumes: ${unencrypted}" \
+        "Set encrypted=true in the launch template block device mapping and replace the instances."
+    else
+      record PASS "EBS volumes encrypted" "all attached volumes encrypted"
+    fi
+  fi
+}
+
+check_security_groups() {
+  section "Inbound access"
+
+  if [ -z "${SECURITY_GROUP_IDS}" ]; then
+    record WARN "no inbound security group rules" \
+      "no security groups to check (no instances found)" ""
+    return 0
+  fi
+
+  local groups
+  # shellcheck disable=SC2086 # SECURITY_GROUP_IDS is a deliberate list
+  groups="$(aws_read ec2 describe-security-groups --group-ids ${SECURITY_GROUP_IDS} --output json || echo '{}')"
+
+  local total_inbound
+  total_inbound="$(printf '%s' "${groups}" | jq '[.SecurityGroups[]?.IpPermissions[]?] | length')"
+
+  if [ "${total_inbound}" -gt 0 ]; then
+    local detail
+    detail="$(printf '%s' "${groups}" |
+      jq -r '[.SecurityGroups[]? | select((.IpPermissions | length) > 0)
+              | "\(.GroupId)(\(.IpPermissions | length) rule(s))"] | join(", ")')"
+    record FAIL "no inbound security group rules" \
+      "${total_inbound} inbound rule(s) across ${detail}" \
+      "Session Manager needs no inbound rule at all. Remove them, or document why each one exists."
+  else
+    record PASS "no inbound security group rules" "0 inbound rules across $(printf '%s' "${groups}" | jq '.SecurityGroups | length') group(s)"
+  fi
+
+  # Port 22 specifically, including rules that merely span it.
+  local ssh_rules
+  ssh_rules="$(printf '%s' "${groups}" |
+    jq -r '[.SecurityGroups[]? as $g | $g.IpPermissions[]?
+            | select((.IpProtocol == "-1")
+                     or ((.FromPort // 0) <= 22 and (.ToPort // 65535) >= 22))
+            | $g.GroupId] | unique | join(", ")')"
+
+  if [ -n "${ssh_rules}" ]; then
+    record FAIL "port 22 closed" \
+      "security groups permitting TCP 22: ${ssh_rules}" \
+      "Closing port 22 is the last step of the migration. If you are mid-migration this is expected; see docs/migrating-from-a-bastion.md."
+  else
+    record PASS "port 22 closed" "no security group rule reaches port 22"
+  fi
+
+  # Rules open to the whole internet are worth calling out separately:
+  # they are the difference between "an inbound rule" and "a bastion".
+  local world_open
+  world_open="$(printf '%s' "${groups}" |
+    jq -r '[.SecurityGroups[]? as $g | $g.IpPermissions[]?
+            | select(.IpRanges[]?.CidrIp == "0.0.0.0/0")
+            | $g.GroupId] | unique | join(", ")')"
+
+  if [ -n "${world_open}" ]; then
+    record FAIL "no inbound rule open to the internet" \
+      "0.0.0.0/0 inbound on: ${world_open}" \
+      "This is a publicly reachable host. It is the thing this kit exists to remove."
+  else
+    record PASS "no inbound rule open to the internet" "no 0.0.0.0/0 inbound rules"
+  fi
+}
+
+check_node_health() {
+  section "Availability"
+
+  local tag_key="${TAG%%=*}" tag_value="${TAG#*=}"
+  local online
+
+  online="$(aws_read ssm describe-instance-information \
+    --filters "Key=tag:${tag_key},Values=${tag_value}" \
+    --output json |
+    jq '[.InstanceInformationList[]? | select(.PingStatus == "Online")] | length' || echo 0)"
+
+  if [ "${online}" -gt 0 ]; then
+    record PASS "a healthy access node is available" "${online} node(s) Online in Session Manager"
+  else
+    record FAIL "a healthy access node is available" \
+      "no node is Online in Session Manager" \
+      "Nobody can reach the VPC right now. Check the ASG capacity, then that the node can reach the ssm and ssmmessages endpoints."
+  fi
+}
+
+check_logging() {
+  section "Session logging"
+
+  if [ -z "${LOG_GROUP}" ]; then
+    record WARN "session logging configured" \
+      "no --log-group given, logging checks skipped" \
+      "Pass --log-group to check retention and encryption. This script will not guess which log group you meant."
+    return 0
+  fi
+
+  local group
+  group="$(aws_read logs describe-log-groups --log-group-name-prefix "${LOG_GROUP}" --output json || echo '{}')"
+
+  local found
+  found="$(printf '%s' "${group}" |
+    jq -r --arg n "${LOG_GROUP}" '[.logGroups[]? | select(.logGroupName == $n)] | length')"
+
+  if [ "${found}" -eq 0 ]; then
+    record FAIL "session log group exists" "no log group named ${LOG_GROUP}" \
+      "Sessions are not being recorded to the group you named."
+    return 0
+  fi
+
+  record PASS "session log group exists" "${LOG_GROUP}"
+
+  local retention kms
+  retention="$(printf '%s' "${group}" |
+    jq -r --arg n "${LOG_GROUP}" '.logGroups[] | select(.logGroupName == $n) | .retentionInDays // 0')"
+  kms="$(printf '%s' "${group}" |
+    jq -r --arg n "${LOG_GROUP}" '.logGroups[] | select(.logGroupName == $n) | .kmsKeyId // ""')"
+
+  if [ "${retention}" = "0" ]; then
+    record WARN "session log retention is defined" "retention is 'never expire'" \
+      "An unbounded audit log is a cost and a liability. Set a retention that matches your policy."
+  else
+    record PASS "session log retention is defined" "${retention} days"
+  fi
+
+  if [ -z "${kms}" ]; then
+    record FAIL "session logs KMS-encrypted" "no KMS key on ${LOG_GROUP}" \
+      "Session transcripts can contain anything typed in a shell. Encrypt the log group with a customer-managed key."
+  else
+    record PASS "session logs KMS-encrypted" "${kms##*/}"
+  fi
+}
+
+check_s3_archive() {
+  [ -n "${S3_BUCKET}" ] || return 0
+
+  section "Session log archive (S3)"
+
+  local pab
+  pab="$(aws_read s3api get-public-access-block --bucket "${S3_BUCKET}" --output json || echo '{}')"
+
+  local all_blocked
+  all_blocked="$(printf '%s' "${pab}" | jq -r '
+    (.PublicAccessBlockConfiguration // {}) as $c
+    | (($c.BlockPublicAcls // false) and ($c.BlockPublicPolicy // false)
+       and ($c.IgnorePublicAcls // false) and ($c.RestrictPublicBuckets // false))')"
+
+  if [ "${all_blocked}" = "true" ]; then
+    record PASS "archive bucket blocks public access" "all four settings enabled"
+  else
+    record FAIL "archive bucket blocks public access" \
+      "public access is not fully blocked on ${S3_BUCKET}" \
+      "Enable all four public access block settings. This bucket holds session transcripts."
+  fi
+
+  local enc
+  enc="$(aws_read s3api get-bucket-encryption --bucket "${S3_BUCKET}" --output json || echo '{}')"
+
+  local algo
+  algo="$(printf '%s' "${enc}" |
+    jq -r '.ServerSideEncryptionConfiguration.Rules[0].ApplyServerSideEncryptionByDefault.SSEAlgorithm // ""')"
+
+  case "${algo}" in
+    "aws:kms")
+      record PASS "archive bucket KMS-encrypted" "SSE-KMS"
+      ;;
+    "AES256")
+      record WARN "archive bucket KMS-encrypted" "SSE-S3 (AES256), not SSE-KMS" \
+        "SSE-S3 gives you no key policy and no separate audit trail for key use. Prefer a customer-managed KMS key."
+      ;;
+    *)
+      record FAIL "archive bucket KMS-encrypted" "no default encryption on ${S3_BUCKET}" \
+        "Enable SSE-KMS with the session key."
+      ;;
+  esac
+
+  local ver
+  ver="$(aws_read s3api get-bucket-versioning --bucket "${S3_BUCKET}" --output json || echo '{}')"
+
+  if [ "$(printf '%s' "${ver}" | jq -r '.Status // ""')" = "Enabled" ]; then
+    record PASS "archive bucket versioned" "versioning enabled"
+  else
+    record WARN "archive bucket versioned" "versioning is not enabled" \
+      "An audit archive where an object can be silently replaced is not an audit archive."
+  fi
+}
+
+# ---------------------------------------------------------------------
+# Arguments
+# ---------------------------------------------------------------------
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --tag)
+      TAG="${2:?--tag needs a value}"
+      shift 2
+      ;;
+    --log-group)
+      LOG_GROUP="${2:?--log-group needs a value}"
+      shift 2
+      ;;
+    --s3-bucket)
+      S3_BUCKET="${2:?--s3-bucket needs a value}"
+      shift 2
+      ;;
+    --region)
+      REGION="${2:?--region needs a value}"
+      shift 2
+      ;;
+    --profile)
+      PROFILE="${2:?--profile needs a value}"
+      shift 2
+      ;;
+    --json)
+      OUTPUT="json"
+      shift
+      ;;
+    --strict)
+      STRICT="true"
+      shift
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    --version)
+      printf '%s %s\n' "${PROGRAM}" "${VERSION}"
+      exit 0
+      ;;
+    *) die "unknown argument '$1' (try --help)" ;;
+  esac
+done
+
+command -v aws >/dev/null 2>&1 || die "the AWS CLI is required"
+command -v jq >/dev/null 2>&1 || die "jq is required"
+
+if [ "${OUTPUT}" = "text" ]; then
+  printf 'bastion-free-ami posture check\n'
+  printf 'tag: %s   region: %s\n' "${TAG}" "${REGION:-<default>}"
+  printf 'read-only: this script makes no AWS write calls\n'
+fi
+
+check_instances
+check_security_groups
+check_node_health
+check_logging
+check_s3_archive
+
+if [ "${OUTPUT}" = "json" ]; then
+  jq -n \
+    --argjson findings "${FINDINGS_JSON}" \
+    --arg tag "${TAG}" \
+    --arg region "${REGION}" \
+    --argjson pass "${PASS_COUNT}" \
+    --argjson warn "${WARN_COUNT}" \
+    --argjson fail "${FAIL_COUNT}" \
+    '{tag:$tag, region:$region, readOnly:true,
+      summary:{pass:$pass, warn:$warn, fail:$fail},
+      findings:$findings}'
+else
+  printf '\n%s\n' "Summary"
+  printf '%s\n' "-------"
+  printf '  %d passed, %d warning(s), %d failure(s)\n' \
+    "${PASS_COUNT}" "${WARN_COUNT}" "${FAIL_COUNT}"
+
+  if [ "${FAIL_COUNT}" -gt 0 ]; then
+    printf '\n%s\n' "This deployment is not bastion-free yet. Each FAIL above has a"
+    printf '%s\n' "suggested remedy; docs/migrating-from-a-bastion.md has the order"
+    printf '%s\n' "to do them in."
+  fi
+fi
+
+if [ "${FAIL_COUNT}" -gt 0 ]; then
+  exit 1
+fi
+if [ "${STRICT}" = "true" ] && [ "${WARN_COUNT}" -gt 0 ]; then
+  exit 1
+fi
+exit 0
