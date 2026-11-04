@@ -54,10 +54,24 @@ command:
     stdout:
       - "0"
 
-  ## No listening TCP socket other than what the OS needs locally.
-  ## Anything bound to a non-loopback address on an access node is a
-  ## surprise worth failing the build over.
-  "ss -ltnH | awk '{print $4}' | grep -vE '^(127\\.0\\.0\\.1|\\[::1\\])' | grep -vE '^\\*?:?(323)$' | wc -l":
+  ## No listening TCP socket on a non-loopback address, OTHER than port
+  ## 22.
+  ##
+  ## Port 22 is excluded deliberately and is not an oversight: Packer
+  ## provisions this image over SSH, so sshd is necessarily listening
+  ## while these tests run -- a check that counted it could only pass
+  ## by breaking the build. goss_no_ssh.yaml asserts the persistent
+  ## state that governs a booted instance (masked + disabled), and
+  ## tests/smoke-test.sh asserts that nothing listens on 22 on a real
+  ## instance launched from the finished AMI.
+  ##
+  ## What this check IS for: catching any OTHER service that a custom
+  ## source AMI left listening on a non-loopback address. On an access
+  ## node that is a surprise worth failing the build over.
+  ##
+  ## Loopback is excluded by matching the whole 127.0.0.0/8 range, not
+  ## just 127.0.0.1 -- systemd-resolved binds 127.0.0.53.
+  "ss -ltnH | awk '{print $4}' | grep -vE '^(127\\.|\\[::1\\])' | grep -vE ':22$' | wc -l":
     exit-status: 0
     stdout:
       - "0"

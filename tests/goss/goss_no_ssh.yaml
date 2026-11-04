@@ -37,12 +37,14 @@ command:
       - "masked"
     stderr: []
 
-  "systemctl is-enabled sshd.socket":
-    # Absent on images without socket activation; either masked or a
-    # missing unit is an acceptable outcome. A plain "enabled" is not.
-    exit-status: 1
-    stdout:
-      - "/masked|^$/"
+  ## sshd.socket is absent on images that do not use socket activation.
+  ## Either masked or a missing unit is an acceptable outcome; a plain
+  ## "enabled" is not. Written as a shell test rather than a bare
+  ## is-enabled because systemctl's exit code for "no such unit"
+  ## differs between systemd versions (1 vs 4), which would make an
+  ## exit-status assertion brittle.
+  "test \"$(systemctl is-enabled sshd.socket 2>/dev/null)\" != 'enabled'":
+    exit-status: 0
 
   ## The mask is a symlink to /dev/null. Checking the link target proves
   ## the mask is real rather than a stale systemd cache entry.
@@ -68,20 +70,39 @@ command:
     exit-status: 0
 
   ## --- the config that would apply is not a soft target -------------
-  "sshd -T -f /etc/ssh/sshd_config.d/00-bastion-free-ami.conf 2>/dev/null | grep -i '^permitrootlogin'":
+  ##
+  ## Checked by grepping the file rather than with `sshd -T`, on
+  ## purpose: `sshd -T` loads host keys, and the access_node role has
+  ## already deleted them by the time these tests run (a baked host key
+  ## would give every instance from this AMI the same SSH identity).
+  ## `sshd -T` would therefore fail with "no hostkeys available" and
+  ## say nothing about the config.
+  ##
+  ## The drop-in's syntax IS validated, at the point it is written:
+  ## the Ansible task uses `validate: sshd -t -f %s`, which runs while
+  ## host keys still exist. That is the right place for it.
+  "grep -cE '^[[:space:]]*PermitRootLogin[[:space:]]+no' /etc/ssh/sshd_config.d/00-bastion-free-ami.conf":
     exit-status: 0
     stdout:
-      - "(?i)permitrootlogin\\s+no"
+      - "1"
 
-  "sshd -T -f /etc/ssh/sshd_config.d/00-bastion-free-ami.conf 2>/dev/null | grep -i '^passwordauthentication'":
+  "grep -cE '^[[:space:]]*PasswordAuthentication[[:space:]]+no' /etc/ssh/sshd_config.d/00-bastion-free-ami.conf":
     exit-status: 0
     stdout:
-      - "(?i)passwordauthentication\\s+no"
+      - "1"
 
-  "sshd -T -f /etc/ssh/sshd_config.d/00-bastion-free-ami.conf 2>/dev/null | grep -i '^allowtcpforwarding'":
+  "grep -cE '^[[:space:]]*AllowTcpForwarding[[:space:]]+no' /etc/ssh/sshd_config.d/00-bastion-free-ami.conf":
     exit-status: 0
     stdout:
-      - "(?i)allowtcpforwarding\\s+no"
+      - "1"
+
+  ## Drop-ins are read before the main config and the first value for a
+  ## keyword wins, so this file's values take precedence over anything
+  ## the base image's sshd_config says.
+  "grep -cE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\\.d/\\*\\.conf' /etc/ssh/sshd_config":
+    exit-status: 0
+    stdout:
+      - "1"
 
   ## --- no key-based way back in -------------------------------------
   ## The build user's own authorized_keys is still in use by this
