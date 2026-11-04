@@ -1,0 +1,31 @@
+# Copy to terraform.tfvars and edit.
+#
+#   cp terraform.tfvars.example terraform.tfvars
+#   terraform init && terraform plan
+
+region = "us-east-1"
+name   = "bfa-mt"
+
+# An existing VPC and its private subnets, one per AZ you want nodes in.
+vpc_id             = "vpc-0123456789abcdef0"
+private_subnet_ids = ["subnet-0aaa...", "subnet-0bbb..."]
+
+instance_type = "t3.small"
+
+# Forwarding targets. Each of these is baked into a session document as
+# a fixed property, so changing one is a Terraform apply, not a runtime
+# parameter. That is the point: it is what makes the allowlist real.
+payments_db_host     = "payments.cluster-abc123.us-east-1.rds.amazonaws.com"
+analytics_db_host    = "analytics-ro.cluster-ro-def456.us-east-1.rds.amazonaws.com"
+analytics_cache_host = "analytics.xyz789.ng.0001.use1.cache.amazonaws.com"
+
+# Who may assume each role. Use specific role ARNs -- an account root
+# ARN here would let any principal in the account assume every team
+# role, which makes the separation above meaningless.
+payments_principal_arns  = ["arn:aws:iam::111122223333:role/AWSReservedSSO_Payments_abc123"]
+analytics_principal_arns = ["arn:aws:iam::111122223333:role/AWSReservedSSO_Analytics_def456"]
+
+# The elevation path. Keep this list as short as you can defend.
+platform_principal_arns = ["arn:aws:iam::111122223333:role/AWSReservedSSO_Platform_ghi789"]
+
+alarm_sns_topic_arns = ["arn:aws:sns:us-east-1:111122223333:platform-alerts"]
