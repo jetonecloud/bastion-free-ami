@@ -1,0 +1,31 @@
+---
+extends: default
+
+yaml-files:
+  - "*.yml"
+  - "*.yaml"
+  - ".yamllint"
+
+rules:
+  line-length:
+    max: 160
+    level: warning
+  comments:
+    min-spaces-from-content: 1
+  comments-indentation: false
+  braces:
+    max-spaces-inside: 1
+  truthy:
+    allowed-values: ["true", "false", "yes", "no"]
+  # Required by ansible-lint: an unquoted 0640 is parsed as a number, not
+  # the file mode the author meant. File modes in this repo are quoted
+  # strings throughout.
+  octal-values:
+    forbid-implicit-octal: true
+    forbid-explicit-octal: true
+
+ignore: |
+  .ansible/
+  ansible/.upstream/
+  packer_cache/
+  .terraform/

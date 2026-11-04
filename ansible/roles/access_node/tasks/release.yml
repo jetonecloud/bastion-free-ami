@@ -1,0 +1,31 @@
+---
+# Identify what this image is, so scripts/verify and tests/smoke-test.sh
+# can tell an access node from any other instance, and so a human who
+# lands in a session knows what they are on and what the rules are.
+
+- name: Create the release directory
+  ansible.builtin.file:
+    path: "{{ access_node_release_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Write the release file
+  ansible.builtin.template:
+    src: release.j2
+    dest: "{{ access_node_release_dir }}/release"
+    owner: root
+    group: root
+    mode: "0644"
+
+# Shown at the start of every Session Manager shell session. The point is
+# not legal boilerplate -- it is to tell the person in the session that
+# what they type is being recorded, before they type a credential.
+- name: Write the session banner
+  ansible.builtin.template:
+    src: session-banner.j2
+    dest: "{{ access_node_release_dir }}/session-banner"
+    owner: root
+    group: root
+    mode: "0644"

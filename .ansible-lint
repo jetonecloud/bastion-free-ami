@@ -1,0 +1,20 @@
+---
+profile: production
+
+exclude_paths:
+  - .github/
+  - tests/
+  - .cache/
+  - ansible/.upstream/
+
+skip_list:
+  # Package versions are pinned by the AL2023 dnf repositories; naming a
+  # version here would pin to a release that gets superseded by the next
+  # weekly rebuild.
+  - package-latest
+
+warn_list:
+  - experimental
+  - yaml[line-length]
+
+use_default_rules: true

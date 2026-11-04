@@ -1,0 +1,48 @@
+---
+# SSM Agent is the entire access path. If it is not running, the node is
+# unreachable -- there is no SSH fallback by design -- so this is asserted
+# explicitly rather than assumed from the base image.
+
+- name: Ensure amazon-ssm-agent is installed
+  ansible.builtin.dnf:
+    name: amazon-ssm-agent
+    state: present
+
+- name: Enable and start amazon-ssm-agent
+  ansible.builtin.systemd_service:
+    name: amazon-ssm-agent
+    enabled: true
+    state: started
+
+- name: Ensure amazon-ssm-agent is not masked
+  ansible.builtin.systemd_service:
+    name: amazon-ssm-agent
+    masked: false
+
+# The agent restarts itself after an update and must come back. An access
+# node whose agent is set to anything other than "enabled" is a node that
+# will be unreachable after its next reboot.
+- name: Verify amazon-ssm-agent is enabled at boot # noqa: command-instead-of-module
+  # A read, not a change; the systemd module cannot return the
+  # enablement state. See the equivalent check in no_ssh.yml.
+  ansible.builtin.command: systemctl is-enabled amazon-ssm-agent
+  register: access_node_ssm_enabled
+  changed_when: false
+
+- name: Fail if the SSM agent would not start at boot
+  ansible.builtin.fail:
+    msg: >-
+      amazon-ssm-agent reports
+      "{{ access_node_ssm_enabled.stdout | trim }}" rather than "enabled".
+      This AMI has no SSH fallback, so an agent that does not start at
+      boot produces an unreachable instance.
+  when: (access_node_ssm_enabled.stdout | trim) not in ["enabled", "enabled-runtime"]
+
+# Session logging to CloudWatch Logs needs `screen` on Linux: without it
+# AWS documents that session log data "might be truncated". It ships by
+# default on AL2023; asserted so the build does not depend on an
+# undocumented base-image default.
+- name: Ensure screen is present so session logs are not truncated
+  ansible.builtin.dnf:
+    name: screen
+    state: present

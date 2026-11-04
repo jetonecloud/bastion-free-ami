@@ -1,0 +1,27 @@
+---
+galaxy_info:
+  role_name: access_node
+  namespace: jetonecloud
+  author: Jet1
+  description: >-
+    Turns a hardened Amazon Linux 2023 host into a bastion-free access
+    node: sshd masked and disabled, the inherited firewall rule allowing
+    SSH removed, ssm-user stripped of sudo, and no database clients or
+    broad tooling.
+  company: Jet1
+  license: Apache-2.0
+  min_ansible_version: "2.15"
+  platforms:
+    # Galaxy's "Amazon" platform has no 2023 entry; the playbook asserts
+    # the actual distribution version at run time instead.
+    - name: Amazon
+      versions:
+        - all
+  galaxy_tags:
+    - aws
+    - ssm
+    - security
+    - hardening
+    - bastion
+
+dependencies: []

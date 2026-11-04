@@ -1,0 +1,17 @@
+PROJECT="bastion-free-ami"
+PROJECT_URL="https://github.com/jetonecloud/bastion-free-ami"
+ROLE="access-node"
+ACCESS_MODEL="ssm-session-manager-only"
+BUILT_AT="{{ ansible_date_time.iso8601 }}"
+BUILD_ARCH="{{ ansible_architecture }}"
+BASE_DISTRIBUTION="{{ ansible_distribution }} {{ ansible_distribution_version }}"
+KERNEL="{{ ansible_kernel }}"
+UPSTREAM_HARDENING_APPLIED="{{ apply_upstream_hardening | default(false) | bool | lower }}"
+
+# Properties this image guarantees. scripts/verify checks the runtime
+# equivalents against the live instance and its AWS configuration.
+SSHD_MASKED="true"
+SSHD_ENABLED="false"
+INBOUND_PORTS="none"
+SSM_USER_SUDO="removed"
+AUDITD_ADMIN_SPACE_LEFT_ACTION="{{ access_node_auditd_admin_space_left_action }}"

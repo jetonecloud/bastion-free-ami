@@ -1,0 +1,38 @@
+---
+# Keep the image empty.
+#
+# An access node forwards TCP; it does not speak the protocols being
+# forwarded. Port forwarding terminates the connection on this host and
+# hands the bytes to the engineer's own client, so a database client here
+# would add CVEs to the one host every engineer can reach, and invite
+# people to type credentials into a session that is being keystroke
+# logged.
+#
+# See docs/design.md, "Decision: an empty node".
+
+- name: Assert no database clients or broad tooling are installed
+  ansible.builtin.package_facts:
+    manager: auto
+
+- name: Identify forbidden packages present on the image
+  ansible.builtin.set_fact:
+    access_node_present_forbidden: >-
+      {{
+        access_node_forbidden_packages
+        | select('in', ansible_facts.packages.keys() | list)
+        | list
+      }}
+
+# These are not installed by this project; the check catches a custom
+# source AMI that brought them along. Removing them silently could break
+# whatever that image was for, so the build stops and asks.
+- name: Fail if the source image brought broad tooling with it
+  ansible.builtin.fail:
+    msg: >-
+      These packages are present but have no place on an access node:
+      {{ access_node_present_forbidden }}. An access node forwards TCP and
+      does not need clients for the protocols it forwards. Either build
+      from a leaner source AMI, or remove the package from
+      access_node_forbidden_packages and record in your own fork why this
+      node needs it.
+  when: access_node_present_forbidden | length > 0

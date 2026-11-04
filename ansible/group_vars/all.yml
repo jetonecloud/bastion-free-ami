@@ -1,0 +1,33 @@
+---
+# Access-node auditd disk policy.
+#
+# Single source of truth: these values both override the upstream auditd
+# role (al2023-base mode, where auditd.conf is written from scratch) and
+# drive the access_node role's re-assertion (hardened-ami mode, where the
+# source AMI already has auditd.conf saying "halt").
+#
+# WHY THESE DIFFER FROM THE UPSTREAM CIS DEFAULTS
+#
+# hardened-al2023 sets admin_space_left_action=halt, disk_full_action=halt,
+# and max_log_file_action=keep_logs. That is the correct CIS posture for a
+# general-purpose server: a host that cannot guarantee its audit trail
+# should stop rather than lose events.
+#
+# On an access node it is dangerous. The access node *is* the access path.
+# A full audit partition during an incident -- exactly when session and
+# audit volume spike -- would halt the instance and lock the whole team
+# out of the VPC at the moment they most need in. The failure mode is
+# self-reinforcing, and anyone with a session can generate audit events,
+# which makes "halt" a denial-of-service primitive against everyone's
+# access.
+#
+# The authoritative record of who connected to what is in CloudTrail and
+# CloudWatch Logs, off-box and unaffected by this disk. Local auditd is
+# corroborating detail. So: record loudly, stay reachable.
+#
+# To restore the stricter CIS posture and accept the availability
+# consequence, set access_node_auditd_admin_space_left_action: halt.
+# docs/design.md and docs/threat-model.md carry the full reasoning.
+access_node_auditd_admin_space_left_action: syslog
+access_node_auditd_disk_full_action: rotate
+access_node_auditd_max_log_file_action: rotate

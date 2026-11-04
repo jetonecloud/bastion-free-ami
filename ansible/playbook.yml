@@ -1,0 +1,76 @@
+---
+# bastion-free-ami: access node playbook.
+#
+# In the default build mode the source AMI is already a hardened
+# hardened-al2023 image, so only the access_node role runs.
+#
+# In al2023-base mode (apply_upstream_hardening=true) the upstream roles
+# run first, fetched at a pinned tag by scripts/fetch-upstream-roles.sh.
+# access_node always runs LAST: it subtracts things the upstream baseline
+# deliberately leaves in place (a working sshd, a firewall rule allowing
+# port 22), so it has to have the final word.
+#
+# The upstream roles are included dynamically rather than listed under
+# `roles:`. A static entry has to resolve even when its `when:` is false,
+# which would make `ansible-playbook --syntax-check` and `ansible-lint`
+# fail on any checkout that has not cloned the upstream repository --
+# i.e. every CI run of the default build mode.
+- name: Build a bastion-free access node
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    apply_upstream_hardening: false
+
+    # Applied in order. Later roles assume earlier ones have run (logging
+    # assumes auditd installed the daemon).
+    upstream_hardening_roles:
+      - common
+      - ssh
+      - kernel
+      - network
+      - auditd
+      - logging
+
+  pre_tasks:
+    - name: Fail fast if this isn't Amazon Linux 2023
+      ansible.builtin.assert:
+        that:
+          - ansible_distribution == "Amazon"
+          - ansible_distribution_major_version is version('2023', '==')
+        fail_msg: >-
+          This playbook only supports Amazon Linux 2023. Detected
+          {{ ansible_distribution }} {{ ansible_distribution_version }}.
+        quiet: true
+
+    - name: Report which build mode is in effect
+      ansible.builtin.debug:
+        msg: >-
+          {{
+            'al2023-base mode: applying the upstream hardened-al2023 roles
+             before access_node.'
+            if apply_upstream_hardening | bool else
+            'hardened-ami mode: source AMI is assumed already hardened;
+             applying access_node only.'
+          }}
+
+  tasks:
+    - name: Apply the upstream hardened-al2023 baseline
+      ansible.builtin.include_role:
+        name: "{{ upstream_role }}"
+      loop: "{{ upstream_hardening_roles }}"
+      loop_control:
+        loop_var: upstream_role
+      when: apply_upstream_hardening | bool
+      vars:
+        # Override the upstream halt-on-full-audit-disk defaults before
+        # auditd.conf is ever written, rather than rewriting it after.
+        # Values and reasoning live in group_vars/all.yml.
+        auditd_admin_space_left_action: "{{ access_node_auditd_admin_space_left_action }}"
+        auditd_disk_full_action: "{{ access_node_auditd_disk_full_action }}"
+        auditd_max_log_file_action: "{{ access_node_auditd_max_log_file_action }}"
+
+    - name: Apply the access-node role
+      ansible.builtin.include_role:
+        name: access_node

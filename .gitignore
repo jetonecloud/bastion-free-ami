@@ -17,6 +17,9 @@ reports/
 # Ansible
 *.retry
 .ansible/
+# Pinned clone of hardened-al2023, fetched by scripts/fetch-upstream-roles.sh
+# for al2023-base build mode. Never vendored into this repo.
+ansible/.upstream/
 
 # Terraform / OpenTofu
 .terraform/

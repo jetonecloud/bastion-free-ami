@@ -1,0 +1,73 @@
+---
+# access_node role defaults.
+#
+# This role is mostly subtraction: the upstream baseline is a hardened
+# general-purpose server that keeps SSH working, and an access node is one
+# where SSH is the thing being removed.
+
+# --- SSH removal -------------------------------------------------------
+#
+# Mask rather than uninstall. Packer provisions this image over SSH, so
+# removing openssh-server mid-build severs the communicator and every
+# later provisioner -- including the Goss and Trivy gates -- fails.
+# Masking gives the same persistent result: on an instance booted from
+# this AMI, sshd cannot start and port 22 does not listen.
+# See docs/design.md, "Why mask rather than removing openssh-server".
+access_node_mask_sshd: true
+
+# Units to neutralise. sshd.socket matters on systems using socket
+# activation: masking sshd.service alone would leave the socket able to
+# spawn it.
+access_node_ssh_units:
+  - sshd.service
+  - sshd.socket
+
+# Remove the firewalld rule that the upstream network role explicitly
+# adds (network_firewalld_allowed_services: [ssh]). Leaving it would mean
+# the image claims to be bastion-free while still permitting port 22 if
+# sshd ever came back.
+access_node_remove_firewalld_ssh: true
+access_node_firewalld_zone: drop
+
+# --- Privilege ---------------------------------------------------------
+#
+# SSM Agent writes "ssm-user ALL=(ALL) NOPASSWD:ALL" into
+# /etc/sudoers.d/ssm-agent-users when it first creates the account, which
+# on current agents is at first session -- after this build finishes. We
+# pre-create the file with AWS's documented comment-only content so
+# interactive sessions land as a genuinely unprivileged user.
+#
+# Elevated access is deliberately a separate, auditable path: an IAM role
+# tagged SSMSessionRunAs=<user>. See docs/access-paths.md.
+access_node_strip_ssm_user_sudo: true
+
+# --- auditd ------------------------------------------------------------
+#
+# Values come from ansible/group_vars/all.yml, which carries the full
+# reasoning for diverging from the upstream CIS defaults.
+access_node_manage_auditd_disk_policy: true
+
+# --- Tooling -----------------------------------------------------------
+#
+# Packages that must NOT be present. Port forwarding terminates TCP on the
+# node and hands the bytes to the engineer's own client, so the node never
+# parses the protocol and needs no client for it. Listing them here makes
+# the intent enforceable (goss_access_node.yaml asserts their absence)
+# rather than merely "we didn't install those".
+access_node_forbidden_packages:
+  - mariadb105
+  - mariadb105-server
+  - mysql
+  - postgresql15
+  - postgresql16
+  - redis6
+  - valkey
+  - mongodb-org-shell
+  - nmap
+  - tcpdump
+  - telnet
+  - nginx
+  - httpd
+
+# Identification file, used by scripts/verify and tests/smoke-test.sh.
+access_node_release_dir: /etc/bastion-free-ami

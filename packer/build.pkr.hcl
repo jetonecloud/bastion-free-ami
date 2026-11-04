@@ -35,7 +35,7 @@ build {
     ansible_env_vars = [
       "ANSIBLE_HOST_KEY_CHECKING=False",
       "ANSIBLE_CONFIG=${path.root}/../ansible/ansible.cfg",
-      "ANSIBLE_ROLES_PATH=${path.root}/../ansible/roles:${path.root}/../ansible/.galaxy-roles",
+      "ANSIBLE_ROLES_PATH=${path.root}/../ansible/roles:${path.root}/../ansible/.upstream/hardened-al2023/ansible/roles",
     ]
   }
 

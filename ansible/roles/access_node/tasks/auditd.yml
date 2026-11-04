@@ -1,0 +1,77 @@
+---
+# Re-assert the access-node auditd disk policy.
+#
+# In al2023-base mode the upstream auditd role already wrote these values
+# (the playbook passes them in). In hardened-ami mode the source AMI has
+# auditd.conf saying admin_space_left_action=halt, so it has to be
+# rewritten here.
+#
+# Rationale for diverging from the upstream CIS default is in
+# ansible/group_vars/all.yml and docs/design.md. Short version: the access
+# node is the access path, and halting it on a full audit partition locks
+# the team out during exactly the incident they need in for.
+
+- name: Check whether auditd.conf exists
+  ansible.builtin.stat:
+    path: /etc/audit/auditd.conf
+  register: access_node_auditd_conf
+
+- name: Set the access-node audit disk policy
+  ansible.builtin.lineinfile:
+    path: /etc/audit/auditd.conf
+    regexp: "^\\s*{{ item.key }}\\s*="
+    line: "{{ item.key }} = {{ item.value }}"
+    state: present
+    owner: root
+    group: root
+    mode: "0640"
+  loop:
+    - key: admin_space_left_action
+      value: "{{ access_node_auditd_admin_space_left_action }}"
+    - key: disk_full_action
+      value: "{{ access_node_auditd_disk_full_action }}"
+    - key: max_log_file_action
+      value: "{{ access_node_auditd_max_log_file_action }}"
+  loop_control:
+    label: "{{ item.key }} = {{ item.value }}"
+  when: access_node_auditd_conf.stat.exists
+  notify: Restart auditd
+
+- name: Record why the policy diverges from the CIS default
+  ansible.builtin.copy:
+    dest: /etc/audit/README.bastion-free-ami
+    content: |
+      Access-node audit disk policy
+      =============================
+
+      This host's /etc/audit/auditd.conf deliberately differs from the
+      CIS Amazon Linux 2023 Benchmark and from the hardened-al2023
+      baseline it was built on:
+
+        admin_space_left_action = {{ access_node_auditd_admin_space_left_action }}   (CIS / upstream: halt)
+        disk_full_action        = {{ access_node_auditd_disk_full_action }}   (CIS / upstream: halt)
+        max_log_file_action     = {{ access_node_auditd_max_log_file_action }}   (upstream: keep_logs)
+
+      Reason: this instance is an access node. It is the path engineers
+      use to reach private VPC resources. Halting it when the audit
+      partition fills would remove that path at exactly the moment it is
+      most needed -- during an incident, when session and audit volume
+      spike. Anyone holding a session can generate audit events, so
+      "halt" would also be a denial-of-service primitive against the
+      whole team's access.
+
+      The authoritative record of who connected to what, when, and for
+      how long is held off this host, in AWS CloudTrail and CloudWatch
+      Logs. Local auditd output is corroborating detail, not the primary
+      evidence. See docs/audit-evidence.md.
+
+      To restore the stricter CIS posture, and accept that a full audit
+      partition will take the access path down, rebuild with:
+
+        access_node_auditd_admin_space_left_action: halt
+
+      Full reasoning: docs/design.md and docs/threat-model.md in
+      https://github.com/jetonecloud/bastion-free-ami
+    owner: root
+    group: root
+    mode: "0644"

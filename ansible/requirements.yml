@@ -1,0 +1,13 @@
+---
+# Install with:
+#   ansible-galaxy collection install -r ansible/requirements.yml
+#
+# The hardened-al2023 roles are NOT listed here. They live under
+# ansible/roles/ inside that repository rather than at its root, so
+# ansible-galaxy cannot install them as roles. They are fetched instead by
+# scripts/fetch-upstream-roles.sh, which clones a pinned tag into
+# ansible/.upstream/ and is only needed in al2023-base build mode
+# (apply_upstream_hardening = true). See docs/design.md.
+collections:
+  - name: ansible.posix
+    version: ">=1.5.4"

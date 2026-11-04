@@ -1,0 +1,145 @@
+---
+# Remove SSH as a way into this host.
+#
+# Runs last in the role. The build's own connection is SSH, so these tasks
+# deliberately do NOT stop the running daemon -- they remove its ability to
+# ever start again. packer/scripts/cleanup.sh stops the listener as the
+# final provisioner, once nothing else needs to connect.
+#
+# Goss asserts the persistent state (disabled + masked + no firewall rule),
+# which is what governs a booted instance. tests/smoke-test.sh proves port
+# 22 is closed on a real instance launched from the finished AMI.
+
+- name: Disable the SSH units so they do not start at boot
+  ansible.builtin.systemd_service:
+    name: "{{ item }}"
+    enabled: false
+  loop: "{{ access_node_ssh_units }}"
+  failed_when: false
+  register: access_node_ssh_disable
+  changed_when: access_node_ssh_disable is changed
+
+# Masking symlinks the unit to /dev/null. Unlike "disabled", it also stops
+# a package update, a dependency, a socket activation, or a well-meaning
+# human from starting sshd. This is the control the Goss suite checks.
+- name: Mask the SSH units so nothing can start them
+  ansible.builtin.systemd_service:
+    name: "{{ item }}"
+    masked: true
+  loop: "{{ access_node_ssh_units }}"
+  failed_when: false
+  when: access_node_mask_sshd | bool
+
+- name: Confirm sshd is masked # noqa: command-instead-of-module
+  # A read, not a change. ansible.builtin.systemd_service cannot report
+  # the enablement state back, and "masked" is precisely the value this
+  # build must not publish an AMI without.
+  ansible.builtin.command: systemctl is-enabled sshd.service
+  register: access_node_sshd_enabled
+  changed_when: false
+  failed_when: false
+
+# A build that cannot prove this should not produce an AMI. Checking here
+# as well as in Goss means the failure is attributed to the task that was
+# supposed to do the work.
+- name: Fail if sshd did not end up masked
+  ansible.builtin.fail:
+    msg: >-
+      sshd.service reports "{{ access_node_sshd_enabled.stdout | trim }}"
+      but should be "masked". Refusing to build an access node whose SSH
+      daemon can still start.
+  when:
+    - access_node_mask_sshd | bool
+    - (access_node_sshd_enabled.stdout | trim) != "masked"
+
+# The upstream network role adds "ssh" to the firewalld drop zone on
+# purpose, so that applying a CIS baseline never locks anyone out. On an
+# access node that rule is exactly what we are removing: this is the
+# "replace any inherited firewall rule that allows SSH" requirement.
+- name: Remove the inherited firewalld rule allowing SSH
+  ansible.posix.firewalld:
+    service: ssh
+    zone: "{{ access_node_firewalld_zone }}"
+    permanent: true
+    immediate: true
+    state: disabled
+  when: access_node_remove_firewalld_ssh | bool
+  failed_when: false
+
+- name: Remove any firewalld rule allowing port 22 directly
+  ansible.posix.firewalld:
+    port: "22/tcp"
+    zone: "{{ access_node_firewalld_zone }}"
+    permanent: true
+    immediate: true
+    state: disabled
+  when: access_node_remove_firewalld_ssh | bool
+  failed_when: false
+
+- name: Deploy an sshd_config drop-in that denies everything
+  ansible.builtin.copy:
+    dest: /etc/ssh/sshd_config.d/00-bastion-free-ami.conf
+    content: |
+      # bastion-free-ami: defence in depth.
+      #
+      # sshd is masked on this image and port 22 is not permitted through
+      # the host firewall, so this file should never be read. It exists so
+      # that if someone unmasks sshd in an emergency, what comes back up
+      # is not a soft target: no passwords, no root, no forwarding, and a
+      # deny-all AllowUsers.
+      #
+      # Drop-ins in this directory are read before the main config and the
+      # first value for a keyword wins, so these take precedence.
+      PermitRootLogin no
+      PasswordAuthentication no
+      PermitEmptyPasswords no
+      # KbdInteractiveAuthentication only; the older
+      # ChallengeResponseAuthentication alias is rejected outright by
+      # newer OpenSSH and would fail the sshd -t validation below.
+      KbdInteractiveAuthentication no
+      GSSAPIAuthentication no
+      HostbasedAuthentication no
+      AllowTcpForwarding no
+      AllowAgentForwarding no
+      X11Forwarding no
+      PermitTunnel no
+      # Deny every user by name. An empty AllowUsers would be a parse
+      # error, so use a principal that cannot exist.
+      AllowUsers bastion-free-ami-no-ssh-allowed
+    owner: root
+    group: root
+    mode: "0600"
+    validate: "/usr/sbin/sshd -t -f %s"
+
+- name: Find authorized_keys files left anywhere on the image
+  ansible.builtin.find:
+    paths:
+      - /root
+      - /home
+    patterns: "authorized_keys*"
+    recurse: true
+    hidden: true
+  register: access_node_authorized_keys
+
+# The build user's own authorized_keys is still in use by this very
+# connection, so it is removed by cleanup.sh rather than here. Everything
+# else is removed now and reported, so a key that arrived from a custom
+# source AMI does not get baked in silently.
+- name: Report authorized_keys files that will be removed at cleanup
+  ansible.builtin.debug:
+    msg: >-
+      authorized_keys present at
+      {{ access_node_authorized_keys.files | map(attribute='path') | list }}.
+      packer/scripts/cleanup.sh removes these as the final provisioner;
+      none are baked into the AMI.
+  when: access_node_authorized_keys.matched > 0
+
+- name: Ensure no EC2 instance can be reached with a baked host key
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/ssh/ssh_host_rsa_key
+    - /etc/ssh/ssh_host_ecdsa_key
+    - /etc/ssh/ssh_host_ed25519_key
+  failed_when: false

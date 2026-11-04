@@ -1,0 +1,13 @@
+---
+# auditd does not support a plain systemd restart on AL2023; the service
+# refuses SIGTERM-based restarts while the kernel audit subsystem holds a
+# reference. "service auditd restart" goes through the init script that
+# handles this correctly.
+- name: Restart auditd # noqa: command-instead-of-module
+  # Not ansible.builtin.service: the systemd unit refuses a normal
+  # restart while the kernel audit subsystem holds a reference, so the
+  # module reports success without the new config taking effect. The
+  # init script handles the stop/start sequence auditd requires.
+  ansible.builtin.command: service auditd restart
+  changed_when: true
+  failed_when: false

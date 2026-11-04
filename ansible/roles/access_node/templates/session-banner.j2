@@ -1,0 +1,22 @@
+-------------------------------------------------------------------------
+ bastion-free-ami access node
+-------------------------------------------------------------------------
+ This shell session is being recorded. Keystrokes and output are streamed
+ to CloudWatch Logs, and the session itself is recorded in CloudTrail.
+
+ Do not type secrets at a prompt. To enter one without it being logged:
+
+     stty -echo; read SECRET; stty echo
+
+ This host is a transit point, not a workstation. It has no database
+ clients by design -- run your own client on your laptop and reach the
+ datastore through port forwarding instead:
+
+     scripts/connect --forward --host <endpoint> --port <port>
+
+ This node is replaced automatically and keeps no state. Anything you
+ leave in a home directory will be gone when it is recycled.
+
+ Built {{ ansible_date_time.iso8601 }} | {{ ansible_architecture }}
+ https://github.com/jetonecloud/bastion-free-ami
+-------------------------------------------------------------------------

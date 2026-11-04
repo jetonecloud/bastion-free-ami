@@ -1,0 +1,32 @@
+---
+# access_node: turn a hardened general-purpose AL2023 host into an access
+# node with no inbound surface.
+#
+# Task order matters. SSH neutralisation comes last within this role so
+# that if an earlier task fails, the build fails while still reachable and
+# debuggable rather than half-converted.
+- name: Include privilege tasks
+  ansible.builtin.import_tasks: privilege.yml
+  tags: [privilege]
+
+- name: Include auditd disk policy tasks
+  ansible.builtin.import_tasks: auditd.yml
+  when: access_node_manage_auditd_disk_policy | bool
+  tags: [auditd]
+
+- name: Include SSM agent tasks
+  ansible.builtin.import_tasks: ssm.yml
+  tags: [ssm]
+
+- name: Include minimal-image tasks
+  ansible.builtin.import_tasks: packages.yml
+  tags: [packages]
+
+- name: Include release-identification tasks
+  ansible.builtin.import_tasks: release.yml
+  tags: [release]
+
+# Last: everything above still needs a working connection.
+- name: Include SSH removal tasks
+  ansible.builtin.import_tasks: no_ssh.yml
+  tags: [no_ssh]
