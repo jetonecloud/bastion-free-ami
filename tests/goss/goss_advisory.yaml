@@ -1,0 +1,52 @@
+## Advisory suite: informational only, never fails the build.
+##
+## These are things a maintainer should know about an image without them
+## blocking a release. Mostly they report on decisions this project
+## deliberately does not make on your behalf, or on upstream state that
+## can change without this repo doing anything wrong.
+
+command:
+  ## openssh-server is still installed, because Packer provisions this
+  ## image over SSH and uninstalling it mid-build severs the connection
+  ## that the test and scan gates depend on. The binary being present is
+  ## the residual gap that masking leaves: a root-level attacker who can
+  ## unmask a unit could start it -- and would then still face a security
+  ## group with no inbound rules. Reported so it is never a surprise.
+  "rpm -q openssh-server":
+    exit-status: 0
+    skip: false
+
+  ## SELinux is not forced to enforcing by the upstream baseline, because
+  ## flipping it fleet-wide breaks workloads unpredictably. Worth knowing
+  ## which mode you actually shipped.
+  "getenforce":
+    exit-status: 0
+    skip: false
+
+  ## ec2-user keeps its cloud-init passwordless sudo. It is unreachable
+  ## interactively -- there is no SSH and Session Manager lands on
+  ## ssm-user -- but it is reachable via Run As with an IAM role tagged
+  ## SSMSessionRunAs=ec2-user, which is the documented break-glass path.
+  ## Reported so the elevation route is visible rather than implicit.
+  "grep -rE '^[[:space:]]*ec2-user[[:space:]]+ALL' /etc/sudoers.d/ 2>/dev/null":
+    exit-status: 0
+    skip: false
+
+  ## Pending OS package updates at bake time. This project patches by
+  ## rebuilding weekly rather than mutating running instances, so a
+  ## non-zero count here on a fresh build means the upstream repos moved
+  ## after the source AMI was published.
+  "dnf -q check-update >/dev/null 2>&1; echo $?":
+    exit-status: 0
+    skip: false
+
+  ## Kernel version shipped, for correlating against advisories later.
+  "uname -r":
+    exit-status: 0
+    skip: false
+
+  ## Size of the image's audit partition. Informs whether the
+  ## rotate-rather-than-halt policy has enough headroom in practice.
+  "df -h /var/log/audit --output=size,avail 2>/dev/null | tail -1":
+    exit-status: 0
+    skip: false

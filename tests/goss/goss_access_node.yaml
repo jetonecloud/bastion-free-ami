@@ -1,0 +1,110 @@
+## Blocking suite: access-node specific properties.
+##
+## Covers the things this repo changes that are not about SSH: session
+## privilege, the auditd disk-policy override, image minimalism, and the
+## agent that is the entire access path.
+
+command:
+  ## --- interactive sessions are not privileged -----------------------
+  ## SSM Agent writes "ssm-user ALL=(ALL) NOPASSWD:ALL" into this file
+  ## when it creates the account, which on a fresh AMI happens at first
+  ## session. The role pre-creates it with AWS's documented comment-only
+  ## content; this check proves no grant line survived.
+  "grep -E '^[[:space:]]*ssm-user[[:space:]]+ALL' /etc/sudoers.d/ssm-agent-users; test $? -ne 0":
+    exit-status: 0
+
+  ## Nor may any other drop-in grant it. A grant parked in a different
+  ## file would make the one above cosmetic.
+  "grep -rE '^[[:space:]]*ssm-user[[:space:]]+ALL' /etc/sudoers /etc/sudoers.d/ 2>/dev/null; test $? -ne 0":
+    exit-status: 0
+
+  ## The sudoers set must still parse. A syntax error here locks out
+  ## sudo entirely, including the documented break-glass path.
+  "visudo -c":
+    exit-status: 0
+
+  ## ssm-user must not be in a privileged group either.
+  "id -nG ssm-user 2>/dev/null | tr ' ' '\\n' | grep -E '^(wheel|root|adm|sudo)$'; test $? -ne 0":
+    exit-status: 0
+
+  ## --- auditd disk policy -------------------------------------------
+  ## Deliberately NOT the CIS default of halt. The access node is the
+  ## access path: halting it when the audit partition fills removes
+  ## everyone's route into the VPC during the incident that filled it.
+  ## See docs/design.md and /etc/audit/README.bastion-free-ami.
+  "grep -E '^[[:space:]]*admin_space_left_action[[:space:]]*=[[:space:]]*halt' /etc/audit/auditd.conf; test $? -ne 0":
+    exit-status: 0
+
+  "grep -E '^[[:space:]]*disk_full_action[[:space:]]*=[[:space:]]*halt' /etc/audit/auditd.conf; test $? -ne 0":
+    exit-status: 0
+
+  ## auditd must still actually be auditing. The override is about the
+  ## disk-full reaction, not about auditing less.
+  "grep -E '^[[:space:]]*admin_space_left_action[[:space:]]*=' /etc/audit/auditd.conf":
+    exit-status: 0
+    stdout:
+      - "/syslog|email|suspend|rotate/"
+
+  ## --- the image is empty -------------------------------------------
+  ## An access node forwards TCP and never parses the protocols it
+  ## forwards, so a client for them is pure attack surface on the one
+  ## host every engineer can reach.
+  "command -v mysql psql redis-cli mongosh kubectl 2>/dev/null | wc -l":
+    exit-status: 0
+    stdout:
+      - "0"
+
+  ## No listening TCP socket other than what the OS needs locally.
+  ## Anything bound to a non-loopback address on an access node is a
+  ## surprise worth failing the build over.
+  "ss -ltnH | awk '{print $4}' | grep -vE '^(127\\.0\\.0\\.1|\\[::1\\])' | grep -vE '^\\*?:?(323)$' | wc -l":
+    exit-status: 0
+    stdout:
+      - "0"
+
+package:
+  ## The access path itself.
+  amazon-ssm-agent:
+    installed: true
+  ## Required on Linux or AWS documents that session log data "might be
+  ## truncated". Ships with AL2023; asserted so the build does not rest
+  ## on an undocumented base-image default.
+  screen:
+    installed: true
+
+service:
+  amazon-ssm-agent:
+    enabled: true
+    running: true
+  auditd:
+    enabled: true
+    running: true
+
+file:
+  /etc/sudoers.d/ssm-agent-users:
+    exists: true
+    owner: root
+    group: root
+    filemode: "0440"
+
+  /etc/audit/README.bastion-free-ami:
+    exists: true
+    contains:
+      - "Access-node audit disk policy"
+
+  /etc/bastion-free-ami/release:
+    exists: true
+    owner: root
+    group: root
+    filemode: "0644"
+    contains:
+      - 'PROJECT="bastion-free-ami"'
+      - 'ROLE="access-node"'
+      - 'ACCESS_MODEL="ssm-session-manager-only"'
+      - 'SSM_USER_SUDO="removed"'
+
+  /etc/bastion-free-ami/session-banner:
+    exists: true
+    contains:
+      - "This shell session is being recorded"
+      - "stty -echo"

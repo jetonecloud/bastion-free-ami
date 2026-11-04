@@ -1,0 +1,123 @@
+## Blocking suite: SSH is gone.
+##
+## This is the suite that backs the project's central claim, so read the
+## scope carefully.
+##
+## WHAT IS ASSERTED, AND WHY IT IS NOT "running: false"
+##
+## Goss runs on the Packer build instance, and Packer reached that
+## instance over SSH -- that is the only way Ansible and these tests got
+## here. So sshd IS running right now, by necessity. A check for
+## `running: false` could only pass by breaking the build that produces
+## the AMI.
+##
+## What governs a booted instance is the PERSISTENT state, and that is
+## what is checked below:
+##
+##   * sshd.service and sshd.socket are masked (symlinked to /dev/null),
+##     so neither systemd, nor socket activation, nor a package update,
+##     nor a human can start them
+##   * sshd.service is not enabled, so it is not started at boot
+##   * the firewalld drop zone does not allow the ssh service or port 22
+##   * the sshd config that would apply, if someone unmasked it, denies
+##     root, passwords, and forwarding
+##
+## packer/scripts/cleanup.sh stops the listener as the final provisioner.
+## tests/smoke-test.sh then launches a real instance from the finished
+## AMI and proves nothing listens on port 22 -- that is where the
+## runtime assertion lives, and it is wired into CI.
+##
+## See docs/design.md, "Consequence for the Goss requirement".
+
+command:
+  ## --- sshd cannot start -------------------------------------------
+  "systemctl is-enabled sshd.service":
+    exit-status: 1 # masked units exit non-zero
+    stdout:
+      - "masked"
+    stderr: []
+
+  "systemctl is-enabled sshd.socket":
+    # Absent on images without socket activation; either masked or a
+    # missing unit is an acceptable outcome. A plain "enabled" is not.
+    exit-status: 1
+    stdout:
+      - "/masked|^$/"
+
+  ## The mask is a symlink to /dev/null. Checking the link target proves
+  ## the mask is real rather than a stale systemd cache entry.
+  "readlink -f /etc/systemd/system/sshd.service":
+    exit-status: 0
+    stdout:
+      - "/dev/null"
+
+  ## --- the firewall does not permit SSH ----------------------------
+  ## The upstream network role adds the ssh service to the drop zone on
+  ## purpose. On an access node that rule must be gone; this check is
+  ## the "replace any inherited firewall rule that allows SSH"
+  ## requirement.
+  "firewall-cmd --zone=drop --query-service=ssh; test $? -ne 0":
+    exit-status: 0
+
+  "firewall-cmd --zone=drop --query-port=22/tcp; test $? -ne 0":
+    exit-status: 0
+
+  ## No zone anywhere may permit ssh. A rule parked in "public" would
+  ## become live the moment the default zone changed.
+  "firewall-cmd --list-all-zones | grep -E '^\\s+services:' | grep -w ssh; test $? -ne 0":
+    exit-status: 0
+
+  ## --- the config that would apply is not a soft target -------------
+  "sshd -T -f /etc/ssh/sshd_config.d/00-bastion-free-ami.conf 2>/dev/null | grep -i '^permitrootlogin'":
+    exit-status: 0
+    stdout:
+      - "(?i)permitrootlogin\\s+no"
+
+  "sshd -T -f /etc/ssh/sshd_config.d/00-bastion-free-ami.conf 2>/dev/null | grep -i '^passwordauthentication'":
+    exit-status: 0
+    stdout:
+      - "(?i)passwordauthentication\\s+no"
+
+  "sshd -T -f /etc/ssh/sshd_config.d/00-bastion-free-ami.conf 2>/dev/null | grep -i '^allowtcpforwarding'":
+    exit-status: 0
+    stdout:
+      - "(?i)allowtcpforwarding\\s+no"
+
+  ## --- no key-based way back in -------------------------------------
+  ## The build user's own authorized_keys is still in use by this
+  ## connection and is removed by cleanup.sh. Any OTHER authorized_keys
+  ## would be baked into the AMI, so there must be none.
+  "find /root /home -name 'authorized_keys*' -not -path '/home/ec2-user/*' | wc -l":
+    exit-status: 0
+    stdout:
+      - "0"
+
+  ## No EC2 key pair metadata should be relied on. A baked host key would
+  ## give every instance from this AMI the same SSH identity.
+  "ls /etc/ssh/ssh_host_*_key 2>/dev/null | wc -l":
+    exit-status: 0
+    stdout:
+      - "0"
+
+file:
+  /etc/ssh/sshd_config.d/00-bastion-free-ami.conf:
+    exists: true
+    owner: root
+    group: root
+    filemode: "0600"
+    contains:
+      - "PermitRootLogin no"
+      - "PasswordAuthentication no"
+      - "AllowTcpForwarding no"
+
+  ## Masked units are symlinks to /dev/null.
+  /etc/systemd/system/sshd.service:
+    exists: true
+    filetype: symlink
+    linked-to: /dev/null
+
+service:
+  ## Not enabled at boot. Deliberately no `running:` key -- see the
+  ## header. The build's own SSH connection is how these tests arrived.
+  sshd:
+    enabled: false

@@ -1,0 +1,78 @@
+## Blocking suite: baseline assumptions.
+##
+## This project builds on a hardened source AMI rather than re-applying
+## someone else's controls (docs/design.md). So this suite does NOT
+## re-test the CIS baseline -- hardened-al2023 gates its own publish on
+## its own suites, and duplicating that here would be testing another
+## repo's contract.
+##
+## What it does test is the handful of assumptions this repo depends on.
+## If any of these is false, the access node is broken in a way that the
+## access-node-specific suites would not notice.
+
+command:
+  ## --- IMDSv2 is required -------------------------------------------
+  ## Enforced in the Packer source block and again in the launch
+  ## template. An unauthenticated read must be refused: on a host where
+  ## every engineer can get a shell, IMDSv1 would hand out the instance
+  ## role's credentials to anything that can make an HTTP request.
+  "curl -s --max-time 5 -o /dev/null -w '%{http_code}' http://169.254.169.254/latest/meta-data/ami-id":
+    exit-status: 0
+    stdout:
+      - "401"
+
+  ## And a token-authenticated read must still work, otherwise the
+  ## instance cannot assume its role at all.
+  "TOKEN=$(curl -s --max-time 5 -X PUT 'http://169.254.169.254/latest/api/token' -H 'X-aws-ec2-metadata-token-ttl-seconds: 60') && curl -s --max-time 5 -o /dev/null -w '%{http_code}' -H \"X-aws-ec2-metadata-token: $TOKEN\" http://169.254.169.254/latest/meta-data/ami-id":
+    exit-status: 0
+    stdout:
+      - "200"
+
+  ## --- no secrets baked into the image ------------------------------
+  ## Trivy's secret scanner is the real gate; these catch the specific
+  ## mistakes this build could plausibly make.
+  "ls /root/.aws /home/*/.aws 2>/dev/null | wc -l":
+    exit-status: 0
+    stdout:
+      - "0"
+
+  "find / -maxdepth 4 -name '*.pem' -not -path '/proc/*' -not -path '/sys/*' -not -path '/usr/share/*' -not -path '/etc/pki/*' 2>/dev/null | wc -l":
+    exit-status: 0
+    stdout:
+      - "0"
+
+  ## Environment files are a common place for a leaked credential.
+  "grep -rlE 'AKIA[0-9A-Z]{16}' /etc /root /home 2>/dev/null | wc -l":
+    exit-status: 0
+    stdout:
+      - "0"
+
+  ## --- the host firewall is default-deny ----------------------------
+  "firewall-cmd --get-default-zone":
+    exit-status: 0
+    stdout:
+      - "drop"
+
+package:
+  firewalld:
+    installed: true
+
+service:
+  firewalld:
+    enabled: true
+    running: true
+  ## Time sync. Session records and audit events are only correlatable
+  ## across sources if the clock is right.
+  chronyd:
+    enabled: true
+    running: true
+
+file:
+  /etc/shadow:
+    exists: true
+    owner: root
+    group: root
+
+  ## No authorized_keys for root under any circumstances.
+  /root/.ssh/authorized_keys:
+    exists: false
