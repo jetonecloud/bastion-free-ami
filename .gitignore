@@ -1,0 +1,52 @@
+# Packer
+packer/*.pkrvars.hcl
+!packer/example.pkrvars.hcl
+!packer/x86_64.pkrvars.hcl
+!packer/arm64.pkrvars.hcl
+!packer/al2023-base.pkrvars.hcl
+packer_cache/
+*.pkr.hcl.bak
+manifest.json
+crash.log
+
+# Build artifacts / reports
+artifacts/
+reports/
+*.log
+
+# Ansible
+*.retry
+.ansible/
+
+# Terraform / OpenTofu
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+terraform.tfvars
+!terraform.tfvars.example
+
+# Python (ansible-lint / pre-commit venvs)
+.venv/
+__pycache__/
+*.pyc
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Secrets - never commit these
+*.pem
+*.ppk
+.env
+.env.*

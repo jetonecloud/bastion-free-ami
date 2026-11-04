@@ -1,0 +1,8 @@
+# Keep everything LF in the repository regardless of the checkout platform.
+# Shell scripts and Goss/Ansible YAML are uploaded verbatim to Linux build
+# instances; CRLF would break shebangs and heredocs.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.gz binary
